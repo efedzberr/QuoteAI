@@ -119,19 +119,20 @@ def match_products():
 
             match, score = best_match(descripcion, catalog)
             resultados.append({
+                "original_text": descripcion,
                 "descripcion_original": descripcion,
                 "codigo": match['code'],
                 "nombre_catalogo": match['name'],
                 "precio": match['price'],
                 "confianza": round(score, 3),
                 "requiere_revision": score < 0.7
-            })
+        })
 
         resultado_final = {
-            "resultados": resultados,
-            "total": len(resultados),
-            "requieren_revision": sum(1 for r in resultados if r['requiere_revision']),
-            "columna_detectada": desc_column
+                "lines": resultados,
+                "total": len(resultados),
+                "requieren_revision": sum(1 for r in resultados if r['requiere_revision']),
+                "columna_detectada": desc_column
         }
 
         return Response(
