@@ -2,7 +2,7 @@ import os
 import re
 import difflib
 import json
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from supabase import create_client
 
 app = Flask(__name__)
@@ -35,11 +35,9 @@ def best_match(query, catalog):
     return cat, combined
 
 def detect_description_column(rows):
-    """Detecta automáticamente cuál columna contiene las descripciones de productos."""
     if not rows:
         return None
     
-    # Columnas candidatas por nombre
     priority_names = ['descripcion', 'description', 'producto', 'product', 
                       'item', 'articulo', 'article', 'nombre', 'name', 
                       'desc', 'material', 'concepto']
@@ -47,12 +45,10 @@ def detect_description_column(rows):
     first_row = rows[0]
     columns = list(first_row.keys())
     
-    # Buscar por nombre prioritario
     for col in columns:
         if any(p in col.lower() for p in priority_names):
             return col
     
-    # Si no, buscar la columna de texto más larga
     best_col = None
     best_avg_len = 0
     for col in columns:
@@ -69,9 +65,11 @@ def match_products():
     try:
         data = request.get_json()
         if not data:
-            return jsonify({"error": "No se recibieron datos"}), 400
+            return Response(
+                json.dumps({"error": "No se recibieron datos"}, ensure_ascii=False),
+                status=400, mimetype='application/json'
+            )
 
-        # Los productos del cliente pueden venir como "rows", "productos", "items", etc.
         client_products = (
             data.get('rows') or
             data.get('productos') or
@@ -82,22 +80,28 @@ def match_products():
         )
 
         if not client_products:
-            return jsonify({"error": "No se encontraron productos en el request"}), 400
+            return Response(
+                json.dumps({"error": "No se encontraron productos en el request"}, ensure_ascii=False),
+                status=400, mimetype='application/json'
+            )
 
-        # Detectar columna de descripción automáticamente
         desc_column = detect_description_column(client_products)
         if not desc_column:
-            return jsonify({"error": "No se pudo detectar la columna de descripción"}), 400
+            return Response(
+                json.dumps({"error": "No se pudo detectar la columna de descripcion"}, ensure_ascii=False),
+                status=400, mimetype='application/json'
+            )
 
-        # Cargar catálogo completo desde Supabase
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         response = supabase.table("products").select("CodigoArt, DescCortaArt, Precio").execute()
         catalog_raw = response.data
 
         if not catalog_raw:
-            return jsonify({"error": "El catálogo está vacío"}), 400
+            return Response(
+                json.dumps({"error": "El catalogo esta vacio"}, ensure_ascii=False),
+                status=400, mimetype='application/json'
+            )
 
-        # Preparar catálogo normalizado
         catalog = []
         for row in catalog_raw:
             catalog.append({
@@ -107,7 +111,6 @@ def match_products():
                 'price': str(row.get('Precio', ''))
             })
 
-        # Hacer matching para cada producto
         resultados = []
         for item in client_products:
             descripcion = str(item.get(desc_column, '') or '').strip()
@@ -117,7 +120,6 @@ def match_products():
             match, score = best_match(descripcion, catalog)
             resultados.append({
                 "descripcion_original": descripcion,
-                "columna_detectada": desc_column,
                 "codigo": match['code'],
                 "nombre_catalogo": match['name'],
                 "precio": match['price'],
@@ -125,19 +127,32 @@ def match_products():
                 "requiere_revision": score < 0.7
             })
 
-        return jsonify({
+        resultado_final = {
             "resultados": resultados,
             "total": len(resultados),
             "requieren_revision": sum(1 for r in resultados if r['requiere_revision']),
             "columna_detectada": desc_column
-        })
+        }
+
+        return Response(
+            json.dumps(resultado_final, ensure_ascii=False),
+            status=200,
+            mimetype='application/json'
+        )
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return Response(
+            json.dumps({"error": str(e)}, ensure_ascii=False),
+            status=500, mimetype='application/json'
+        )
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok"})
+    return Response(
+        json.dumps({"status": "ok"}),
+        status=200,
+        mimetype='application/json'
+    )
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
