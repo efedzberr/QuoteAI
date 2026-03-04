@@ -91,7 +91,7 @@ def match_products():
 
         # Cargar catálogo completo desde Supabase
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        response = supabase.table("Products").select("CodigoArt, DescCortaArt, Precio").execute()
+        response = supabase.table("products").select("CodigoArt, DescCortaArt, Precio").execute()
         catalog_raw = response.data
 
         if not catalog_raw:
