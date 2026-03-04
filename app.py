@@ -2,7 +2,7 @@ import os
 import re
 import difflib
 import json
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, Response
 from supabase import create_client
 
 app = Flask(__name__)
@@ -126,20 +126,19 @@ def match_products():
                 "precio": match['price'],
                 "confianza": round(score, 3),
                 "requiere_revision": score < 0.7
-        })
+            })
 
-        resultado_final = {
-                "lines": resultados,
-                "total": len(resultados),
-                "requieren_revision": sum(1 for r in resultados if r['requiere_revision']),
-                "columna_detectada": desc_column
-        }
-
-        return Response(
-            json.dumps(resultado_final, ensure_ascii=False),
-            status=200,
-            mimetype='application/json'
+        # Construir JSON como string para evitar que Make lo desestructure
+        items_json = ','.join([json.dumps(r, ensure_ascii=False) for r in resultados])
+        json_str = (
+            '{"lines":['
+            + items_json
+            + '],"total":' + str(len(resultados))
+            + ',"requieren_revision":' + str(sum(1 for r in resultados if r['requiere_revision']))
+            + ',"columna_detectada":"' + desc_column + '"}'
         )
+
+        return Response(json_str, status=200, mimetype='application/json')
 
     except Exception as e:
         return Response(
