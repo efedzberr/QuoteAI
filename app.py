@@ -1,5 +1,6 @@
 import os
 import re
+import csv
 import difflib
 import json
 from flask import Flask, request, Response
@@ -23,21 +24,23 @@ UNIT_SYNONYMS = {
 }
 SYNONYM_MAP = {v: k for k, variants in UNIT_SYNONYMS.items() for v in variants}
 
+
 def normalize(text):
+    """Normalize text: uppercase, remove accents, remove punctuation,
+    collapse spaces, and apply unit synonyms — from match2.py logic."""
     if not text:
         return ""
     text = str(text).upper().strip()
     for a, b in [('Á','A'),('É','E'),('Í','I'),('Ó','O'),('Ú','U'),('Ü','U'),('Ñ','N')]:
         text = text.replace(a, b)
-    text = re.sub(r'[^\w\s@/.]', ' ', text)
+    text = re.sub(r'[^\w\s]', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
     tokens = [SYNONYM_MAP.get(t, t) for t in text.split()]
     return ' '.join(t for t in tokens if t)
 
-def extract_numbers(text):
-    return set(re.findall(r'\d+(?:[.,]\d+)?', text))
 
 def build_catalog_entry(row):
+    """Build enriched catalog entry including attribute fields."""
     name = row.get('DescCortaArt', '') or ''
     atribs = []
     for i in range(4, 9):
@@ -45,59 +48,51 @@ def build_catalog_entry(row):
         v = row.get(f'ValorAtrib{i}', '') or ''
         if k or v:
             atribs.append(f"{k} {v}")
+    # Enrich norm with name repeated 3x + attributes (keeps catalog name dominant)
     enriched = ' '.join([name, name, name, ' '.join(atribs)])
     return {
-        'code':      row.get('CodigoArt', ''),
-        'name':      name,
-        'price':     str(row.get('Precio', '') or ''),
-        'norm':      normalize(enriched),
-        'norm_name': normalize(name),
-        'numbers':   extract_numbers(normalize(name)),
+        'code':  row.get('CodigoArt', ''),
+        'name':  name,
+        'price': str(row.get('Precio', '') or ''),
+        'norm':  normalize(enriched),      # enriched norm used for scoring
+        'norm_name': normalize(name),      # pure name norm (for reference)
     }
 
-def score_match(query, entry):
-    norm_q    = normalize(query)
-    norm_name = entry['norm_name']
-    norm_full = entry['norm']
-    q_words   = set(norm_q.split())
-    q_numbers = extract_numbers(norm_q)
-
-    # NIVEL 1: Coincidencia exacta
-    if norm_q == norm_name:
-        return 1.0
-
-    # NIVEL 2: Uno contiene al otro
-    if norm_q in norm_name or norm_name in norm_q:
-        len_ratio = min(len(norm_q), len(norm_name)) / max(len(norm_q), len(norm_name))
-        return 0.90 + (len_ratio * 0.09)
-
-    # NIVEL 3: Overlap alto de palabras
-    name_words = set(norm_name.split())
-    overlap = len(q_words & name_words) / max(len(q_words), len(name_words)) if q_words and name_words else 0
-
-    number_bonus = 0
-    if q_numbers and entry['numbers']:
-        matched = q_numbers & entry['numbers']
-        number_bonus = len(matched) / max(len(q_numbers), 1) * 0.15
-
-    code_bonus = 0.20 if entry['code'] and normalize(entry['code']) in norm_q else 0
-
-    if overlap >= 0.6:
-        return min(0.70 + overlap * 0.20 + number_bonus + code_bonus, 1.0)
-
-    # NIVEL 4: Fuzzy como último recurso
-    seq_name = difflib.SequenceMatcher(None, norm_q, norm_name).ratio()
-    seq_full = difflib.SequenceMatcher(None, norm_q, norm_full).ratio()
-    score = seq_name * 0.45 + seq_full * 0.20 + overlap * 0.20 + number_bonus + code_bonus
-    return min(score, 1.0)
 
 def best_match(query, catalog):
-    scored = [(score_match(query, entry), i, entry) for i, entry in enumerate(catalog)]
+    """
+    Match algorithm from match2.py:
+    - SequenceMatcher ratio (text similarity)
+    - Word overlap / Jaccard-like score
+    - Combined score = 0.5 * seq + 0.5 * overlap
+    Applied against the enriched 'norm' field of each catalog entry.
+    """
+    norm_q = normalize(query)
+    q_words = set(norm_q.split())
+
+    scored = []
+    for entry in catalog:
+        norm_e = entry['norm']
+        e_words = set(norm_e.split())
+
+        seq = difflib.SequenceMatcher(None, norm_q, norm_e).ratio()
+
+        if q_words and e_words:
+            overlap = len(q_words & e_words) / max(len(q_words), len(e_words))
+        else:
+            overlap = 0.0
+
+        combined = 0.5 * seq + 0.5 * overlap
+        scored.append((combined, seq, overlap, entry))
+
     scored.sort(key=lambda x: x[0], reverse=True)
-    best_score, _, best_entry = scored[0]
-    return best_entry, round(best_score, 3)
+    combined, seq, overlap, best_entry = scored[0]
+
+    return best_entry, round(combined, 3)
+
 
 def detect_description_column(rows):
+    """Auto-detect which column contains product descriptions."""
     if not rows:
         return None
     priority_names = [
@@ -109,6 +104,7 @@ def detect_description_column(rows):
     for col in columns:
         if any(p in col.lower() for p in priority_names):
             return col
+    # Fallback: column with longest average value
     best_col, best_avg = None, 0
     for col in columns:
         values = [str(r.get(col, '') or '') for r in rows[:10]]
@@ -118,12 +114,16 @@ def detect_description_column(rows):
             best_col = col
     return best_col
 
+
 @app.route('/match', methods=['POST'])
 def match_products():
     try:
         data = request.get_json()
         if not data:
-            return Response(json.dumps({"error": "No se recibieron datos"}, ensure_ascii=False), status=400, mimetype='application/json')
+            return Response(
+                json.dumps({"error": "No se recibieron datos"}, ensure_ascii=False),
+                status=400, mimetype='application/json'
+            )
 
         client_products = (
             data.get('rows') or data.get('productos') or
@@ -132,12 +132,19 @@ def match_products():
         )
 
         if not client_products:
-            return Response(json.dumps({"error": "No se encontraron productos"}, ensure_ascii=False), status=400, mimetype='application/json')
+            return Response(
+                json.dumps({"error": "No se encontraron productos"}, ensure_ascii=False),
+                status=400, mimetype='application/json'
+            )
 
         desc_column = detect_description_column(client_products)
         if not desc_column:
-            return Response(json.dumps({"error": "No se pudo detectar columna de descripcion"}, ensure_ascii=False), status=400, mimetype='application/json')
+            return Response(
+                json.dumps({"error": "No se pudo detectar columna de descripcion"}, ensure_ascii=False),
+                status=400, mimetype='application/json'
+            )
 
+        # Load catalog from Supabase
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         resp = supabase.table("products").select(
             "CodigoArt, DescCortaArt, Precio, "
@@ -148,10 +155,14 @@ def match_products():
         catalog_raw = resp.data
 
         if not catalog_raw:
-            return Response(json.dumps({"error": "El catalogo esta vacio"}, ensure_ascii=False), status=400, mimetype='application/json')
+            return Response(
+                json.dumps({"error": "El catalogo esta vacio"}, ensure_ascii=False),
+                status=400, mimetype='application/json'
+            )
 
         catalog = [build_catalog_entry(row) for row in catalog_raw]
 
+        # Match each client product
         resultados = []
         for item in client_products:
             descripcion = str(item.get(desc_column, '') or '').strip()
@@ -168,6 +179,7 @@ def match_products():
                 "requiere_revision":    score < 0.7
             })
 
+        # Build JSON response in Make-compatible format
         items_json = ','.join([json.dumps(r, ensure_ascii=False) for r in resultados])
         json_str = (
             '{"lines":['
@@ -179,11 +191,16 @@ def match_products():
         return Response(json_str, status=200, mimetype='application/json')
 
     except Exception as e:
-        return Response(json.dumps({"error": str(e)}, ensure_ascii=False), status=500, mimetype='application/json')
+        return Response(
+            json.dumps({"error": str(e)}, ensure_ascii=False),
+            status=500, mimetype='application/json'
+        )
+
 
 @app.route('/health', methods=['GET'])
 def health():
     return Response(json.dumps({"status": "ok"}), status=200, mimetype='application/json')
+
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
