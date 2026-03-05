@@ -76,9 +76,9 @@ def build_catalog_entry(row):
     dept        = row.get('DeptoArt', '')
     brand       = row.get('Marca') or row.get('Manufacturer', '')
 
-    # Atributos dinámicos (hasta 8 pares ATRIBUTO/ValorAtrib)
+    # Atributos dinámicos (pares ATRIBUTO/ValorAtrib del 4 al 8)
     atribs = []
-    for i in range(1, 9):
+    for i in range(4, 9):
         k = row.get(f'ATRIBUTO{i}', '')
         v = row.get(f'ValorAtrib{i}', '')
         if k or v:
@@ -236,12 +236,10 @@ def match_products():
         # Cargar catálogo completo desde Supabase
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         resp = supabase.table("products").select(
-            "CodigoArt, DescCortaArt, DescLargaArt, Precio, UMP, "
-            "CategoriaArt, SubCategoriaArt, DeptoArt, Marca, "
-            "ATRIBUTO1, ValorAtrib1, ATRIBUTO2, ValorAtrib2, "
-            "ATRIBUTO3, ValorAtrib3, ATRIBUTO4, ValorAtrib4, "
-            "ATRIBUTO5, ValorAtrib5, ATRIBUTO6, ValorAtrib6, "
-            "ATRIBUTO7, ValorAtrib7, ATRIBUTO8, ValorAtrib8"
+            "CodigoArt, DescCortaArt, Precio, "
+            "ATRIBUTO4, ValorAtrib4, ATRIBUTO5, ValorAtrib5, "
+            "ATRIBUTO6, ValorAtrib6, ATRIBUTO7, ValorAtrib7, "
+            "ATRIBUTO8, ValorAtrib8"
         ).execute()
         catalog_raw = resp.data
 
