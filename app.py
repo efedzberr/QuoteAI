@@ -113,53 +113,46 @@ def build_catalog_entry(row):
 # ---------------------------------------------------------------------------
 
 def score_match(query, entry):
-    norm_q      = normalize(query)
-    q_words     = set(norm_q.split())
-    q_numbers   = extract_numbers(norm_q)
-    q_tokens    = set(norm_q.split())
+    norm_q    = normalize(query)
+    norm_name = entry['norm_name']
+    norm_full = entry['norm']
+    q_words   = set(norm_q.split())
+    q_numbers = extract_numbers(norm_q)
 
-    # 1. Similitud de secuencia contra nombre corto (peso 35%)
-    seq_name = difflib.SequenceMatcher(None, norm_q, entry['norm_name']).ratio()
+    # NIVEL 1: Coincidencia exacta
+    if norm_q == norm_name:
+        return 1.0
 
-    # 2. Similitud de secuencia contra texto enriquecido (peso 20%)
-    seq_full = difflib.SequenceMatcher(None, norm_q, entry['norm']).ratio()
+    # NIVEL 2: Uno contiene al otro
+    if norm_q in norm_name or norm_name in norm_q:
+        len_ratio = min(len(norm_q), len(norm_name)) / max(len(norm_q), len(norm_name))
+        return 0.90 + (len_ratio * 0.09)
 
-    # 3. Overlap de palabras contra nombre (peso 25%)
-    name_words = set(entry['norm_name'].split())
-    if q_words and name_words:
-        overlap_name = len(q_words & name_words) / max(len(q_words), len(name_words))
-    else:
-        overlap_name = 0
+    # NIVEL 3: Overlap de palabras clave
+    name_words = set(norm_name.split())
+    overlap = len(q_words & name_words) / max(len(q_words), len(name_words)) if q_words and name_words else 0
 
-    # 4. Overlap de palabras contra texto completo (peso 10%)
-    full_words = set(entry['norm'].split())
-    if q_words and full_words:
-        overlap_full = len(q_words & full_words) / max(len(q_words), len(full_words))
-    else:
-        overlap_full = 0
-
-    # 5. Bonus por coincidencia exacta de números (voltaje, amperes, etc.)
     number_bonus = 0
     if q_numbers and entry['numbers']:
-        matched_nums = q_numbers & entry['numbers']
-        number_bonus = len(matched_nums) / max(len(q_numbers), 1) * 0.15
+        matched = q_numbers & entry['numbers']
+        number_bonus = len(matched) / max(len(q_numbers), 1) * 0.15
 
-    # 6. Bonus si el código aparece en la query
-    code_bonus = 0
-    if entry['code'] and normalize(entry['code']) in norm_q:
-        code_bonus = 0.20
+    code_bonus = 0.20 if entry['code'] and normalize(entry['code']) in norm_q else 0
 
-    # Score combinado
+    if overlap >= 0.6:
+        return min(0.70 + overlap * 0.20 + number_bonus + code_bonus, 1.0)
+
+    # NIVEL 4: Fuzzy como ultimo recurso
+    seq_name = difflib.SequenceMatcher(None, norm_q, norm_name).ratio()
+    seq_full = difflib.SequenceMatcher(None, norm_q, norm_full).ratio()
+
     score = (
-        seq_name    * 0.35 +
-        seq_full    * 0.20 +
-        overlap_name * 0.25 +
-        overlap_full * 0.10 +
+        seq_name * 0.45 +
+        seq_full * 0.20 +
+        overlap  * 0.20 +
         number_bonus +
         code_bonus
     )
-
-    # Cap a 1.0
     return min(score, 1.0)
 
 def best_match(query, catalog):
