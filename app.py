@@ -304,6 +304,18 @@ def match_products():
             if not descripcion:
                 continue
 
+            # Leer cantidad y unidad del input original (varios nombres posibles)
+            cant = (
+                item.get('Cant') or item.get('cant') or
+                item.get('cantidad') or item.get('qty') or
+                item.get('quantity') or '1'
+            )
+            unid = (
+                item.get('Unid') or item.get('unid') or
+                item.get('unidad') or item.get('uom') or
+                item.get('unit') or 'PZA'
+            )
+
             # Pasamos supabase a match_product para que Pasada 2 pueda usarlo
             result = match_product(descripcion, catalog, supabase)
             resultados.append({
@@ -314,6 +326,8 @@ def match_products():
                 "precio":               result["precio"],
                 "confianza":            result["confianza"],
                 "requiere_revision":    result["requiere_revision"],
+                "cant":                 cant,
+                "unid":                 unid,
             })
 
         # Respuesta en formato compatible con Make
