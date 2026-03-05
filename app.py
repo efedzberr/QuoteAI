@@ -281,6 +281,51 @@ def match_products():
             status=500, mimetype='application/json'
         )
 
+
+@app.route('/diagnose', methods=['POST'])
+def diagnose():
+    """Endpoint de diagnóstico: muestra top 3 candidatos por producto."""
+    try:
+        data = request.get_json()
+        client_products = (
+            data.get('rows') or data.get('productos') or
+            data.get('items') or data.get('articulos') or
+            data.get('products') or []
+        )
+        desc_column = detect_description_column(client_products)
+
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        resp = supabase.table("products").select(
+            "CodigoArt, DescCortaArt, Precio, "
+            "ATRIBUTO4, ValorAtrib4, ATRIBUTO5, ValorAtrib5, "
+            "ATRIBUTO6, ValorAtrib6, ATRIBUTO7, ValorAtrib7, "
+            "ATRIBUTO8, ValorAtrib8"
+        ).execute()
+        catalog = [build_catalog_entry(row) for row in resp.data]
+
+        diagnostico = []
+        for item in client_products[:5]:  # Solo primeros 5
+            descripcion = str(item.get(desc_column, '') or '').strip()
+            if not descripcion:
+                continue
+            scored = sorted([(score_match(descripcion, e), e) for e in catalog], reverse=True)
+            top3 = [{"score": round(s,3), "code": e["code"], "name": e["name"]} for s,e in scored[:3]]
+            diagnostico.append({
+                "query": descripcion,
+                "norm_query": normalize(descripcion),
+                "top3": top3
+            })
+
+        return Response(
+            json.dumps({"diagnostico": diagnostico}, ensure_ascii=False),
+            status=200, mimetype='application/json'
+        )
+    except Exception as e:
+        return Response(
+            json.dumps({"error": str(e)}, ensure_ascii=False),
+            status=500, mimetype='application/json'
+        )
+
 # ---------------------------------------------------------------------------
 # ENDPOINT /health
 # ---------------------------------------------------------------------------
