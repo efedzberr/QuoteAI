@@ -59,22 +59,22 @@ def extract_keywords(norm_text, min_len=3):
 
 
 # ---------------------------------------------------------------------------
-# Construcción del catálogo
+# Construcción de entrada de catálogo
 # ---------------------------------------------------------------------------
 def build_catalog_entry(row):
     name = row.get('DescCortaArt', '') or ''
     norm = normalize(name)
     return {
-        'code':      row.get('CodigoArt', ''),
-        'name':      name,
-        'price':     str(row.get('Precio', '') or ''),
-        'norm':      norm,
-        'norm_set':  set(norm.split()),   # set pre-calculado para intersección rápida
+        'code':     row.get('CodigoArt', ''),
+        'name':     name,
+        'price':    str(row.get('Precio', '') or ''),
+        'norm':     norm,
+        'norm_set': set(norm.split()),
     }
 
 
 # ---------------------------------------------------------------------------
-# PASADA 1 — Fuzzy Match (SequenceMatcher + Jaccard, igual que match2.py)
+# PASADA 1 — Fuzzy Match en memoria (SequenceMatcher + Jaccard)
 # ---------------------------------------------------------------------------
 def fuzzy_match(query, catalog):
     norm_q  = normalize(query)
@@ -97,14 +97,17 @@ def fuzzy_match(query, catalog):
 
 
 # ---------------------------------------------------------------------------
-# PASADA 2 — Intersección de palabras clave
+# PASADA 2 — Intersección de palabras clave via ILIKE en Supabase
 # ---------------------------------------------------------------------------
-def keyword_intersection_match(query, catalog):
+def keyword_ilike_match(query, supabase):
     """
-    Para cada palabra clave significativa de la query:
-      - Recoge los códigos de todos los productos que contienen esa palabra.
-    Luego cuenta en cuántas búsquedas aparece cada código.
-    El ganador es el código que aparece en más búsquedas (máxima intersección).
+    Para cada palabra clave significativa:
+      1. Hace SELECT con ILIKE '%keyword%' en Supabase (igual que tu SQL manual)
+      2. Recoge los CodigoArt que devuelve cada búsqueda
+      3. Cuenta en cuántas búsquedas aparece cada código (intersección)
+      4. El ganador es el código con mayor número de coincidencias
+      5. En caso de empate, desempata con fuzzy score contra la query
+    Devuelve: (mejor_entry, keywords_coincidentes, total_keywords)
     """
     norm_q   = normalize(query)
     keywords = extract_keywords(norm_q)
@@ -112,32 +115,73 @@ def keyword_intersection_match(query, catalog):
     if not keywords:
         return None, 0, 0
 
-    # Contar en cuántas keywords aparece cada código
-    code_counter = Counter()
+    # Por cada keyword → ILIKE query a Supabase
+    code_counter  = Counter()   # código → cuántas keywords lo encontraron
+    code_to_entry = {}          # código → datos del producto
+
     for kw in keywords:
-        for entry in catalog:
-            if kw in entry['norm_set']:
-                code_counter[entry['code']] += 1
+        try:
+            resp = supabase.table("products").select(
+                "CodigoArt, DescCortaArt, Precio"
+            ).ilike("DescCortaArt", f"%{kw}%").execute()
+
+            for row in (resp.data or []):
+                code = row.get('CodigoArt', '')
+                if code:
+                    code_counter[code] += 1
+                    if code not in code_to_entry:
+                        code_to_entry[code] = {
+                            'code':  code,
+                            'name':  row.get('DescCortaArt', ''),
+                            'price': str(row.get('Precio', '') or ''),
+                            'norm':  normalize(row.get('DescCortaArt', '')),
+                        }
+        except Exception:
+            # Si falla una keyword, continuamos con las demás
+            continue
 
     if not code_counter:
         return None, 0, 0
 
-    best_code, best_count = code_counter.most_common(1)[0]
-    best_entry = next((e for e in catalog if e['code'] == best_code), None)
+    total_keywords = len(keywords)
 
-    return best_entry, best_count, len(keywords)
+    # Encontrar el máximo de coincidencias
+    max_count = code_counter.most_common(1)[0][1]
+
+    # Candidatos con el mismo máximo → desempatar con fuzzy score
+    candidates = [
+        code for code, count in code_counter.items()
+        if count == max_count
+    ]
+
+    if len(candidates) == 1:
+        best_code  = candidates[0]
+        best_count = max_count
+    else:
+        # Desempate: el que tenga mayor similitud fuzzy con la query original
+        norm_q = normalize(query)
+        best_code  = max(
+            candidates,
+            key=lambda c: difflib.SequenceMatcher(
+                None, norm_q, code_to_entry[c]['norm']
+            ).ratio()
+        )
+        best_count = max_count
+
+    best_entry = code_to_entry.get(best_code)
+    return best_entry, best_count, total_keywords
 
 
 # ---------------------------------------------------------------------------
 # Lógica principal de matching (dos pasadas)
 # ---------------------------------------------------------------------------
-def match_product(query, catalog):
+def match_product(query, catalog, supabase):
     """
-    Pasada 1: Fuzzy Match.
-      - score >= 0.70 → resultado directo, no requiere revisión.
-    Pasada 2: Intersección de palabras clave.
-      - Confianza proporcional a palabras coincidentes (escala 0.40–0.69).
-      - Si ninguna palabra coincide → NO ENCONTRADO.
+    Pasada 1: Fuzzy en memoria.
+      - score >= 0.70 → resultado directo, requiere_revision = False
+    Pasada 2: Intersección ILIKE en Supabase.
+      - Confianza proporcional escalada entre 0.40 y 0.69
+      - Si ninguna keyword encuentra nada → NO ENCONTRADO (nunca basura)
     """
     # --- Pasada 1: Fuzzy ---
     match1, score1 = fuzzy_match(query, catalog)
@@ -150,8 +194,8 @@ def match_product(query, catalog):
             "requiere_revision": False,
         }
 
-    # --- Pasada 2: Intersección de keywords ---
-    match2, matched_kw, total_kw = keyword_intersection_match(query, catalog)
+    # --- Pasada 2: ILIKE en Supabase ---
+    match2, matched_kw, total_kw = keyword_ilike_match(query, supabase)
 
     if match2 is None or matched_kw == 0:
         return {
@@ -171,8 +215,7 @@ def match_product(query, catalog):
         "nombre_catalogo":   match2['name'],
         "precio":            match2['price'],
         "confianza":         confidence,
-        "metodo":            f"keywords_{matched_kw}_de_{total_kw}",
-        "requiere_revision": True,  # siempre revisar resultados de pasada 2
+        "requiere_revision": True,   # siempre revisar resultados de pasada 2
     }
 
 
@@ -234,10 +277,15 @@ def match_products():
                 status=400, mimetype='application/json'
             )
 
-        # Cargar catálogo desde Supabase
-        supabase    = create_client(SUPABASE_URL, SUPABASE_KEY)
-        resp        = supabase.table("products").select(
-            "CodigoArt, DescCortaArt, Precio, ATRIBUTO4, ValorAtrib4, ATRIBUTO5, ValorAtrib5, ATRIBUTO6, ValorAtrib6, ATRIBUTO7, ValorAtrib7, ATRIBUTO8, ValorAtrib8"
+        # Conexión a Supabase — se reutiliza para Pasada 1 y Pasada 2
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+        # Cargar catálogo completo para Pasada 1 (fuzzy en memoria)
+        resp = supabase.table("products").select(
+            "CodigoArt, DescCortaArt, Precio, "
+            "ATRIBUTO4, ValorAtrib4, ATRIBUTO5, ValorAtrib5, "
+            "ATRIBUTO6, ValorAtrib6, ATRIBUTO7, ValorAtrib7, "
+            "ATRIBUTO8, ValorAtrib8"
         ).execute()
         catalog_raw = resp.data
 
@@ -256,7 +304,8 @@ def match_products():
             if not descripcion:
                 continue
 
-            result = match_product(descripcion, catalog)
+            # Pasamos supabase a match_product para que Pasada 2 pueda usarlo
+            result = match_product(descripcion, catalog, supabase)
             resultados.append({
                 "original_text":        descripcion,
                 "descripcion_original": descripcion,
