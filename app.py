@@ -298,6 +298,35 @@ def catalog_sample():
         )
 
 
+@app.route('/search-test', methods=['GET'])
+def search_test():
+    """Busca productos específicos en Supabase por nombre."""
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        terms = [
+            'Placa Venecia',
+            'Atenuador',
+            'Lampara Noche Puerquito',
+            'Apagador Sencillo Roma',
+            'Abrazadera',
+            'Cuchillas Repuesto Cutter',
+        ]
+        resultados = {}
+        for term in terms:
+            resp = supabase.table("products").select("CodigoArt, DescCortaArt") \
+                .ilike("DescCortaArt", f"%{term}%").limit(3).execute()
+            resultados[term] = resp.data
+        return Response(
+            json.dumps(resultados, ensure_ascii=False),
+            status=200, mimetype='application/json'
+        )
+    except Exception as e:
+        return Response(
+            json.dumps({"error": str(e)}, ensure_ascii=False),
+            status=500, mimetype='application/json'
+        )
+
+
 @app.route('/health', methods=['GET'])
 def health():
     return Response(json.dumps({"status": "ok"}), status=200, mimetype='application/json')
