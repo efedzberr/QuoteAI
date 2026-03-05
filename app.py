@@ -48,14 +48,11 @@ def build_catalog_entry(row):
         v = row.get(f'ValorAtrib{i}', '') or ''
         if k or v:
             atribs.append(f"{k} {v}")
-    # Enrich norm with name repeated 3x + attributes (keeps catalog name dominant)
-    enriched = ' '.join([name, name, name, ' '.join(atribs)])
     return {
         'code':  row.get('CodigoArt', ''),
         'name':  name,
         'price': str(row.get('Precio', '') or ''),
-        'norm':  normalize(enriched),      # enriched norm used for scoring
-        'norm_name': normalize(name),      # pure name norm (for reference)
+        'norm':  normalize(name),
     }
 
 
