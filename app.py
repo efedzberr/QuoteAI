@@ -331,14 +331,14 @@ def match_products():
             })
 
         # Respuesta en formato compatible con Make
-        items_json = ','.join([json.dumps(r, ensure_ascii=False) for r in resultados])
-        json_str = (
-            '{"lines":['
-            + items_json
-            + '],"total":' + str(len(resultados))
-            + ',"requieren_revision":' + str(sum(1 for r in resultados if r['requiere_revision']))
-            + ',"columna_detectada":"' + desc_column + '"}'
-        )
+        # json.dumps garantiza que lines sea array de objetos reales, no strings
+        response_data = {
+            "lines":              resultados,
+            "total":              len(resultados),
+            "requieren_revision": sum(1 for r in resultados if r['requiere_revision']),
+            "columna_detectada":  desc_column
+        }
+        json_str = json.dumps(response_data, ensure_ascii=False)
         return Response(json_str, status=200, mimetype='application/json')
 
     except Exception as e:
