@@ -206,6 +206,18 @@ def match_product(query, catalog, supabase):
             "requiere_revision": True,
         }
 
+    # Mínimo 2 keywords coincidentes si la query tiene 3 o más keywords.
+    # Evita devolver productos basura que solo coinciden en 1 palabra genérica.
+    min_required = 2 if total_kw >= 3 else 1
+    if matched_kw < min_required:
+        return {
+            "codigo":            "NO ENCONTRADO",
+            "nombre_catalogo":   "NO ENCONTRADO",
+            "precio":            "",
+            "confianza":         0.0,
+            "requiere_revision": True,
+        }
+
     # Confianza proporcional escalada entre 0.40 y 0.69
     ratio      = matched_kw / total_kw
     confidence = round(0.40 + ratio * 0.29, 3)
