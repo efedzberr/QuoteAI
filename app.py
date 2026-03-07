@@ -206,9 +206,17 @@ def match_product(query, catalog, supabase):
             "requiere_revision": True,
         }
 
-    # Mínimo 2 keywords coincidentes si la query tiene 3 o más keywords.
-    # Evita devolver productos basura que solo coinciden en 1 palabra genérica.
-    min_required = 2 if total_kw >= 3 else 1
+    # Mínimo de keywords coincidentes según tamaño de la query:
+    # - 1 o 2 keywords en total → requiere 1 coincidencia
+    # - 3 o 4 keywords en total → requiere 2 coincidencias
+    # - 5 o más keywords en total → requiere 3 coincidencias
+    if total_kw >= 5:
+        min_required = 3
+    elif total_kw >= 3:
+        min_required = 2
+    else:
+        min_required = 1
+
     if matched_kw < min_required:
         return {
             "codigo":            "NO ENCONTRADO",
