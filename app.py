@@ -2,6 +2,7 @@ import os
 import re
 import difflib
 import json
+import unicodedata
 from collections import Counter
 from flask import Flask, request, Response
 from supabase import create_client
@@ -37,20 +38,55 @@ STOPWORDS = {
     'AND', 'OR', 'FOR', 'TO', 'IN', 'AT', 'BY',
 }
 
+# ---------------------------------------------------------------------------
+# Posibles nombres de columna donde puede venir el código del producto
+# ---------------------------------------------------------------------------
+CODE_COLUMN_NAMES = [
+    'codigoart', 'codigo', 'code', 'sku', 'clave',
+    'cve', 'cve_art', 'cveart', 'no_parte', 'noparte',
+    'numparte', 'partnumber', 'part_number', 'item_code',
+    'itemcode', 'product_code', 'productcode', 'ref', 'referencia'
+]
+
 
 # ---------------------------------------------------------------------------
 # Normalización
 # ---------------------------------------------------------------------------
+def strip_accents(text):
+    """
+    Quita acentos y diacríticos latinos de cualquier texto (mayúsculas o
+    minúsculas). Usa NFKD para descomponer caracteres como 'é' -> 'e' + tilde
+    y luego elimina las marcas combinantes. La 'ñ' se trata aparte porque en
+    español es una letra distinta de 'n', no una 'n' acentuada.
+    """
+    if text is None:
+        return ""
+    text = str(text)
+    # Tratar Ñ/ñ explícitamente antes de la descomposición Unicode
+    text = text.replace('Ñ', 'N').replace('ñ', 'n')
+    # NFKD descompone los demás caracteres acentuados; luego filtramos las marcas
+    nfkd = unicodedata.normalize('NFKD', text)
+    return ''.join(c for c in nfkd if not unicodedata.combining(c))
+
+
 def normalize(text):
     if not text:
         return ""
-    text = str(text).upper().strip()
-    for a, b in [('Á','A'),('É','E'),('Í','I'),('Ó','O'),('Ú','U'),('Ü','U'),('Ñ','N')]:
-        text = text.replace(a, b)
+    text = strip_accents(text).upper().strip()
     text = re.sub(r'[^\w\s]', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
     tokens = [SYNONYM_MAP.get(t, t) for t in text.split()]
     return ' '.join(t for t in tokens if t)
+
+
+def normalize_code(code):
+    """Normaliza un código de producto: mayúsculas, sin espacios ni símbolos."""
+    if code is None:
+        return ""
+    code = str(code).strip().upper()
+    # Quitar espacios internos y caracteres no alfanuméricos comunes (guiones, puntos)
+    code = re.sub(r'[\s\-\.]+', '', code)
+    return code
 
 
 def extract_keywords(norm_text, min_len=3):
@@ -59,18 +95,130 @@ def extract_keywords(norm_text, min_len=3):
 
 
 # ---------------------------------------------------------------------------
+# Detección y extracción del código del producto
+# ---------------------------------------------------------------------------
+def detect_code_column(rows):
+    """Busca una columna que parezca contener el código del producto."""
+    if not rows:
+        return None
+    columns = list(rows[0].keys())
+    for col in columns:
+        col_lower = col.lower().replace(' ', '').replace('_', '')
+        for candidate in CODE_COLUMN_NAMES:
+            cand_clean = candidate.replace('_', '')
+            if col_lower == cand_clean or cand_clean in col_lower:
+                return col
+    return None
+
+
+def extract_code_from_text(text):
+    """
+    Intenta extraer un código de producto del texto.
+    Busca tokens que parezcan códigos: predominantemente numéricos
+    o alfanuméricos con al menos 4 caracteres, sin ser palabras comunes.
+    Retorna el primer candidato razonable encontrado.
+    """
+    if not text:
+        return None
+    text = str(text).strip()
+
+    # Patrón 1: secuencia de 5+ dígitos (formato típico de CodigoArt en este catálogo)
+    m = re.search(r'\b(\d{5,})\b', text)
+    if m:
+        return m.group(1)
+
+    # Patrón 2: alfanumérico con letras y números, 4-20 caracteres
+    # (ej. "AB-1234", "X100", "SKU-9876")
+    candidates = re.findall(r'\b([A-Z]+[\-\.]?\d+[A-Z0-9\-\.]*)\b', text.upper())
+    if candidates:
+        # Filtrar candidatos que sean unidades técnicas comunes
+        excluded = {'3P', '2P', '1P', 'KW', 'HP', 'HZ', 'MM', 'PZ',
+                    'V', 'A', '24V', '110V', '220V', '440V', '60HZ', '50HZ'}
+        for c in candidates:
+            clean = re.sub(r'[\-\.]', '', c)
+            if clean not in excluded and len(clean) >= 4:
+                return c
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Construcción de entrada de catálogo
 # ---------------------------------------------------------------------------
 def build_catalog_entry(row):
     name = row.get('DescCortaArt', '') or ''
     norm = normalize(name)
+    code = row.get('CodigoArt', '') or ''
     return {
-        'code':     row.get('CodigoArt', ''),
-        'name':     name,
-        'price':    str(row.get('Precio', '') or ''),
-        'norm':     norm,
-        'norm_set': set(norm.split()),
+        'code':      code,
+        'norm_code': normalize_code(code),
+        'name':      name,
+        'price':     str(row.get('Precio', '') or ''),
+        'norm':      norm,
+        'norm_set':  set(norm.split()),
     }
+
+
+# ---------------------------------------------------------------------------
+# PASADA 0 — Búsqueda directa por código en Supabase
+# ---------------------------------------------------------------------------
+def code_lookup(code, supabase, catalog_by_code=None):
+    """
+    Busca un producto por su CodigoArt directamente.
+    1) Primero intenta en el catálogo en memoria (más rápido).
+    2) Si no encuentra, consulta Supabase con coincidencia exacta.
+    Retorna el entry del producto o None si no existe.
+    """
+    if not code:
+        return None
+
+    norm = normalize_code(code)
+    if not norm:
+        return None
+
+    # 1) Intentar en memoria primero
+    if catalog_by_code and norm in catalog_by_code:
+        return catalog_by_code[norm]
+
+    # 2) Consulta directa a Supabase (eq = igualdad exacta)
+    try:
+        resp = supabase.table("products").select(
+            "CodigoArt, DescCortaArt, Precio"
+        ).eq("CodigoArt", code).limit(1).execute()
+        rows = resp.data or []
+        if rows:
+            row = rows[0]
+            return {
+                'code':      row.get('CodigoArt', ''),
+                'norm_code': normalize_code(row.get('CodigoArt', '')),
+                'name':      row.get('DescCortaArt', ''),
+                'price':     str(row.get('Precio', '') or ''),
+                'norm':      normalize(row.get('DescCortaArt', '')),
+            }
+    except Exception:
+        pass
+
+    # 3) Último intento: si el código original tenía caracteres especiales,
+    #    probar con la versión normalizada (sin guiones/espacios)
+    if norm != str(code).strip().upper():
+        try:
+            resp = supabase.table("products").select(
+                "CodigoArt, DescCortaArt, Precio"
+            ).eq("CodigoArt", norm).limit(1).execute()
+            rows = resp.data or []
+            if rows:
+                row = rows[0]
+                return {
+                    'code':      row.get('CodigoArt', ''),
+                    'norm_code': normalize_code(row.get('CodigoArt', '')),
+                    'name':      row.get('DescCortaArt', ''),
+                    'price':     str(row.get('Precio', '') or ''),
+                    'norm':      normalize(row.get('DescCortaArt', '')),
+                }
+        except Exception:
+            pass
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -97,16 +245,23 @@ def fuzzy_match(query, catalog):
 
 
 # ---------------------------------------------------------------------------
-# PASADA 2 — Intersección de palabras clave via ILIKE en Supabase
+# PASADA 2 — Intersección de palabras clave en catálogo en memoria
 # ---------------------------------------------------------------------------
-def keyword_ilike_match(query, supabase):
+def keyword_ilike_match(query, catalog, supabase=None):
     """
+    Intersección de palabras clave hecha en memoria sobre el catálogo ya
+    cargado y normalizado (sin acentos). Esto reemplaza la versión anterior
+    basada en ILIKE de Supabase, que NO era insensible a acentos cuando el
+    catálogo guardaba descripciones con tildes (p.ej. "Eléctrica").
+
     Para cada palabra clave significativa:
-      1. Hace SELECT con ILIKE '%keyword%' en Supabase (igual que tu SQL manual)
-      2. Recoge los CodigoArt que devuelve cada búsqueda
-      3. Cuenta en cuántas búsquedas aparece cada código (intersección)
-      4. El ganador es el código con mayor número de coincidencias
-      5. En caso de empate, desempata con fuzzy score contra la query
+      1. Recorre el catálogo y marca cada producto cuyo nombre normalizado
+         contenga la keyword como substring.
+      2. Cuenta en cuántas keywords aparece cada producto (intersección).
+      3. El ganador es el producto con mayor número de coincidencias.
+      4. En caso de empate, desempata con fuzzy score contra la query.
+
+    El parámetro `supabase` se mantiene por compatibilidad pero ya no se usa.
     Devuelve: (mejor_entry, keywords_coincidentes, total_keywords)
     """
     norm_q   = normalize(query)
@@ -115,74 +270,90 @@ def keyword_ilike_match(query, supabase):
     if not keywords:
         return None, 0, 0
 
-    # Por cada keyword → ILIKE query a Supabase
-    code_counter  = Counter()   # código → cuántas keywords lo encontraron
-    code_to_entry = {}          # código → datos del producto
+    code_counter = Counter()
 
     for kw in keywords:
-        try:
-            resp = supabase.table("products").select(
-                "CodigoArt, DescCortaArt, Precio"
-            ).ilike("DescCortaArt", f"%{kw}%").execute()
-
-            for row in (resp.data or []):
-                code = row.get('CodigoArt', '')
-                if code:
-                    code_counter[code] += 1
-                    if code not in code_to_entry:
-                        code_to_entry[code] = {
-                            'code':  code,
-                            'name':  row.get('DescCortaArt', ''),
-                            'price': str(row.get('Precio', '') or ''),
-                            'norm':  normalize(row.get('DescCortaArt', '')),
-                        }
-        except Exception:
-            # Si falla una keyword, continuamos con las demás
-            continue
+        for entry in catalog:
+            # 'norm' ya está sin acentos y en mayúsculas, así que el substring
+            # match es totalmente insensible a acentos y a may/min.
+            if kw in entry['norm']:
+                code_counter[entry['code']] += 1
 
     if not code_counter:
         return None, 0, 0
 
+    # Indexar el catálogo por código una sola vez para resolver el ganador
+    catalog_by_code = {e['code']: e for e in catalog if e['code']}
+
     total_keywords = len(keywords)
-
-    # Encontrar el máximo de coincidencias
     max_count = code_counter.most_common(1)[0][1]
-
-    # Candidatos con el mismo máximo → desempatar con fuzzy score
-    candidates = [
-        code for code, count in code_counter.items()
-        if count == max_count
-    ]
+    candidates = [c for c, count in code_counter.items() if count == max_count]
 
     if len(candidates) == 1:
-        best_code  = candidates[0]
-        best_count = max_count
+        best_code = candidates[0]
     else:
-        # Desempate: el que tenga mayor similitud fuzzy con la query original
-        norm_q = normalize(query)
-        best_code  = max(
+        best_code = max(
             candidates,
             key=lambda c: difflib.SequenceMatcher(
-                None, norm_q, code_to_entry[c]['norm']
+                None, norm_q, catalog_by_code[c]['norm']
             ).ratio()
         )
-        best_count = max_count
 
-    best_entry = code_to_entry.get(best_code)
-    return best_entry, best_count, total_keywords
+    best_entry = catalog_by_code.get(best_code)
+    if best_entry is None:
+        return None, 0, 0
+
+    # Devolvemos el entry con el formato esperado por match_product
+    return {
+        'code':  best_entry['code'],
+        'name':  best_entry['name'],
+        'price': best_entry['price'],
+        'norm':  best_entry['norm'],
+    }, max_count, total_keywords
 
 
 # ---------------------------------------------------------------------------
-# Lógica principal de matching (dos pasadas)
+# Lógica principal de matching (tres pasadas)
 # ---------------------------------------------------------------------------
-def match_product(query, catalog, supabase):
+def match_product(query, code, catalog, catalog_by_code, supabase):
     """
-    Pasada 1: Fuzzy en memoria.
+    Pasada 0: Búsqueda por código (si se proporcionó).
+      - Match exacto → confianza = 1.0, requiere_revision = False
+    Pasada 1: Fuzzy en memoria sobre la descripción.
       - score >= 0.70 → resultado directo, requiere_revision = False
     Pasada 2: Intersección ILIKE en Supabase.
       - Confianza proporcional escalada entre 0.40 y 0.69
-      - Si ninguna keyword encuentra nada → NO ENCONTRADO (nunca basura)
+      - Si ninguna keyword encuentra nada → NO ENCONTRADO
     """
+    # --- Pasada 0: Código del producto ---
+    code_to_try = code
+    if not code_to_try and query:
+        # Si no hay código explícito, intentar extraerlo del texto
+        code_to_try = extract_code_from_text(query)
+
+    if code_to_try:
+        match0 = code_lookup(code_to_try, supabase, catalog_by_code)
+        if match0:
+            return {
+                "codigo":            match0['code'],
+                "nombre_catalogo":   match0['name'],
+                "precio":            match0['price'],
+                "confianza":         1.0,
+                "requiere_revision": False,
+                "metodo":            "codigo",
+            }
+
+    # Si no hay descripción para hacer fallback, retornar NO ENCONTRADO
+    if not query or not query.strip():
+        return {
+            "codigo":            "NO ENCONTRADO",
+            "nombre_catalogo":   "NO ENCONTRADO",
+            "precio":            "",
+            "confianza":         0.0,
+            "requiere_revision": True,
+            "metodo":            "ninguno",
+        }
+
     # --- Pasada 1: Fuzzy ---
     match1, score1 = fuzzy_match(query, catalog)
     if score1 >= 0.70:
@@ -192,10 +363,11 @@ def match_product(query, catalog, supabase):
             "precio":            match1['price'],
             "confianza":         score1,
             "requiere_revision": False,
+            "metodo":            "fuzzy",
         }
 
-    # --- Pasada 2: ILIKE en Supabase ---
-    match2, matched_kw, total_kw = keyword_ilike_match(query, supabase)
+    # --- Pasada 2: Intersección de keywords en catálogo en memoria ---
+    match2, matched_kw, total_kw = keyword_ilike_match(query, catalog, supabase)
 
     if match2 is None or matched_kw == 0:
         return {
@@ -204,12 +376,10 @@ def match_product(query, catalog, supabase):
             "precio":            "",
             "confianza":         0.0,
             "requiere_revision": True,
+            "metodo":            "ninguno",
         }
 
-    # Mínimo de keywords coincidentes según tamaño de la query:
-    # - 1 o 2 keywords en total → requiere 1 coincidencia
-    # - 3 o 4 keywords en total → requiere 2 coincidencias
-    # - 5 o más keywords en total → requiere 3 coincidencias
+    # Mínimo de keywords coincidentes según tamaño de la query
     if total_kw >= 5:
         min_required = 3
     elif total_kw >= 3:
@@ -224,9 +394,9 @@ def match_product(query, catalog, supabase):
             "precio":            "",
             "confianza":         0.0,
             "requiere_revision": True,
+            "metodo":            "ninguno",
         }
 
-    # Confianza proporcional escalada entre 0.40 y 0.69
     ratio      = matched_kw / total_kw
     confidence = round(0.40 + ratio * 0.29, 3)
 
@@ -235,7 +405,8 @@ def match_product(query, catalog, supabase):
         "nombre_catalogo":   match2['name'],
         "precio":            match2['price'],
         "confianza":         confidence,
-        "requiere_revision": True,   # siempre revisar resultados de pasada 2
+        "requiere_revision": True,
+        "metodo":            "keyword",
     }
 
 
@@ -291,16 +462,19 @@ def match_products():
             )
 
         desc_column = detect_description_column(client_products)
-        if not desc_column:
+        code_column = detect_code_column(client_products)
+
+        if not desc_column and not code_column:
             return Response(
-                json.dumps({"error": "No se pudo detectar columna de descripcion"}, ensure_ascii=False),
+                json.dumps({"error": "No se pudo detectar columna de descripcion ni de codigo"},
+                           ensure_ascii=False),
                 status=400, mimetype='application/json'
             )
 
-        # Conexión a Supabase — se reutiliza para Pasada 1 y Pasada 2
+        # Conexión a Supabase
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-        # Cargar catálogo completo para Pasada 1 (fuzzy en memoria)
+        # Cargar catálogo completo
         resp = supabase.table("products").select(
             "CodigoArt, DescCortaArt, Precio, "
             "ATRIBUTO4, ValorAtrib4, ATRIBUTO5, ValorAtrib5, "
@@ -317,14 +491,29 @@ def match_products():
 
         catalog = [build_catalog_entry(row) for row in catalog_raw]
 
+        # Índice de catálogo por código normalizado (para lookup O(1))
+        catalog_by_code = {
+            entry['norm_code']: entry
+            for entry in catalog
+            if entry['norm_code']
+        }
+
         # Procesar cada producto del cliente
         resultados = []
         for item in client_products:
-            descripcion = str(item.get(desc_column, '') or '').strip()
-            if not descripcion:
+            descripcion = (
+                str(item.get(desc_column, '') or '').strip()
+                if desc_column else ''
+            )
+            codigo_in = (
+                str(item.get(code_column, '') or '').strip()
+                if code_column else ''
+            )
+
+            # Si no hay ni descripción ni código, omitir el renglón
+            if not descripcion and not codigo_in:
                 continue
 
-            # Leer cantidad y unidad del input original (varios nombres posibles)
             cant = (
                 item.get('Cant') or item.get('cant') or
                 item.get('cantidad') or item.get('qty') or
@@ -336,27 +525,31 @@ def match_products():
                 item.get('unit') or 'PZA'
             )
 
-            # Pasamos supabase a match_product para que Pasada 2 pueda usarlo
-            result = match_product(descripcion, catalog, supabase)
+            result = match_product(
+                descripcion, codigo_in,
+                catalog, catalog_by_code, supabase
+            )
+
             resultados.append({
                 "original_text":        descripcion,
                 "descripcion_original": descripcion,
+                "codigo_original":      codigo_in,
                 "codigo":               result["codigo"],
                 "nombre_catalogo":      result["nombre_catalogo"],
                 "precio":               result["precio"],
                 "confianza":            result["confianza"],
                 "requiere_revision":    result["requiere_revision"],
+                "metodo":               result["metodo"],
                 "cant":                 cant,
                 "unid":                 unid,
             })
 
-        # Respuesta en formato compatible con Make
-        # json.dumps garantiza que lines sea array de objetos reales, no strings
         response_data = {
             "lines":              resultados,
             "total":              len(resultados),
             "requieren_revision": sum(1 for r in resultados if r['requiere_revision']),
-            "columna_detectada":  desc_column
+            "columna_descripcion": desc_column,
+            "columna_codigo":      code_column,
         }
         json_str = json.dumps(response_data, ensure_ascii=False)
         return Response(json_str, status=200, mimetype='application/json')
