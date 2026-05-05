@@ -493,14 +493,38 @@ def match_products():
         # Conexión a Supabase
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-        # Cargar catálogo completo
-        resp = supabase.table("products").select(
-            "CodigoArt, DescCortaArt, Precio, "
-            "ATRIBUTO4, ValorAtrib4, ATRIBUTO5, ValorAtrib5, "
-            "ATRIBUTO6, ValorAtrib6, ATRIBUTO7, ValorAtrib7, "
-            "ATRIBUTO8, ValorAtrib8"
-        ).execute()
-        catalog_raw = resp.data
+        # Cargar catálogo completo — IMPORTANTE: PostgREST (la capa que usa
+        # Supabase por debajo) limita las respuestas a 1000 filas por defecto.
+        # supabase-py no pagina automáticamente, así que tenemos que hacerlo
+        # manualmente con .range(start, end). Si no, los productos cuyos id
+        # caen fuera de las primeras 1000 filas nunca se cargan al catálogo
+        # en memoria y por lo tanto nunca pueden matchear como exacto/fuzzy.
+        PAGE_SIZE = 1000
+        catalog_raw = []
+        offset = 0
+        while True:
+            resp = supabase.table("products").select(
+                "CodigoArt, DescCortaArt, Precio, "
+                "ATRIBUTO4, ValorAtrib4, ATRIBUTO5, ValorAtrib5, "
+                "ATRIBUTO6, ValorAtrib6, ATRIBUTO7, ValorAtrib7, "
+                "ATRIBUTO8, ValorAtrib8"
+            ).range(offset, offset + PAGE_SIZE - 1).execute()
+
+            page = resp.data or []
+            if not page:
+                break
+
+            catalog_raw.extend(page)
+
+            # Si la página vino con menos de PAGE_SIZE filas, es la última.
+            if len(page) < PAGE_SIZE:
+                break
+
+            offset += PAGE_SIZE
+
+            # Salvaguarda contra bucles infinitos (catálogos enormes o bugs).
+            if offset > 100000:
+                break
 
         if not catalog_raw:
             return Response(
@@ -597,3 +621,4 @@ def health():
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
+
