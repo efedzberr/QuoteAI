@@ -315,13 +315,15 @@ def keyword_ilike_match(query, catalog, supabase=None):
 # ---------------------------------------------------------------------------
 # Lógica principal de matching (tres pasadas)
 # ---------------------------------------------------------------------------
-def match_product(query, code, catalog, catalog_by_code, supabase):
+def match_product(query, code, catalog, catalog_by_code, catalog_by_norm, supabase):
     """
     Pasada 0: Búsqueda por código (si se proporcionó).
       - Match exacto → confianza = 1.0, requiere_revision = False
-    Pasada 1: Fuzzy en memoria sobre la descripción.
+    Pasada 1: Match exacto por descripción normalizada (sin acentos, sin puntuación).
+      - Match exacto → confianza = 1.0, requiere_revision = False
+    Pasada 2: Fuzzy en memoria sobre la descripción.
       - score >= 0.70 → resultado directo, requiere_revision = False
-    Pasada 2: Intersección ILIKE en Supabase.
+    Pasada 3: Intersección de palabras clave en catálogo en memoria.
       - Confianza proporcional escalada entre 0.40 y 0.69
       - Si ninguna keyword encuentra nada → NO ENCONTRADO
     """
@@ -354,7 +356,24 @@ def match_product(query, code, catalog, catalog_by_code, supabase):
             "metodo":            "ninguno",
         }
 
-    # --- Pasada 1: Fuzzy ---
+    # --- Pasada 1: Match exacto por descripción normalizada ---
+    # Si la descripción del cliente, una vez normalizada (sin acentos, sin
+    # puntuación, sin espacios extra, mayúsculas, sinónimos de unidades
+    # aplicados), coincide letra por letra con la descripción normalizada de
+    # algún producto del catálogo, lo damos por bueno con confianza 1.0.
+    norm_query = normalize(query)
+    if norm_query and norm_query in catalog_by_norm:
+        match_exact = catalog_by_norm[norm_query]
+        return {
+            "codigo":            match_exact['code'],
+            "nombre_catalogo":   match_exact['name'],
+            "precio":            match_exact['price'],
+            "confianza":         1.0,
+            "requiere_revision": False,
+            "metodo":            "exacto",
+        }
+
+    # --- Pasada 2: Fuzzy ---
     match1, score1 = fuzzy_match(query, catalog)
     if score1 >= 0.70:
         return {
@@ -366,7 +385,7 @@ def match_product(query, code, catalog, catalog_by_code, supabase):
             "metodo":            "fuzzy",
         }
 
-    # --- Pasada 2: Intersección de keywords en catálogo en memoria ---
+    # --- Pasada 3: Intersección de keywords en catálogo en memoria ---
     match2, matched_kw, total_kw = keyword_ilike_match(query, catalog, supabase)
 
     if match2 is None or matched_kw == 0:
@@ -498,6 +517,15 @@ def match_products():
             if entry['norm_code']
         }
 
+        # Índice de catálogo por descripción normalizada (para match exacto O(1)).
+        # Si dos productos del catálogo tienen exactamente la misma descripción
+        # normalizada, conservamos el primero (en la práctica son duplicados o
+        # variantes, y el match exacto no debería resolver ambigüedades).
+        catalog_by_norm = {}
+        for entry in catalog:
+            if entry['norm'] and entry['norm'] not in catalog_by_norm:
+                catalog_by_norm[entry['norm']] = entry
+
         # Procesar cada producto del cliente
         resultados = []
         for item in client_products:
@@ -527,7 +555,7 @@ def match_products():
 
             result = match_product(
                 descripcion, codigo_in,
-                catalog, catalog_by_code, supabase
+                catalog, catalog_by_code, catalog_by_norm, supabase
             )
 
             resultados.append({
