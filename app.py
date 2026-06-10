@@ -1,11 +1,27 @@
 import os
 import re
+import time
 import difflib
 import json
 import unicodedata
 from collections import Counter
 from flask import Flask, request, Response
 from supabase import create_client
+
+# ===========================================================================
+# FASE 1 — Matching acelerado
+# ---------------------------------------------------------------------------
+# Cambios vs. la versión anterior (sin tocar el contrato con Bolt/Make):
+#   1. El catálogo se carga UNA sola vez en memoria (no en cada request) con
+#      un cliente de Supabase reutilizado y un TTL configurable.
+#   2. Se construye un ÍNDICE INVERTIDO (palabra -> productos) al cargar.
+#   3. El fuzzy y el match por keywords ya NO recorren los ~30k productos:
+#      corren solo sobre ~100 candidatos pre-filtrados por el índice invertido.
+#   4. Se elimina el lookup por-línea a Supabase de la Pasada 0 (el catálogo
+#      completo ya está en memoria).
+#   5. Endpoint POST /catalog/refresh para invalidar la caché tras actualizar
+#      el catálogo. La caché también se precalienta al arrancar.
+# ===========================================================================
 
 app = Flask(__name__)
 
@@ -159,77 +175,180 @@ def build_catalog_entry(row):
     }
 
 
+# ===========================================================================
+# CATÁLOGO EN MEMORIA (caché) + ÍNDICE INVERTIDO  —  núcleo de la Fase 1
+# ===========================================================================
+# El catálogo (~30k productos) se carga y normaliza UNA sola vez por proceso.
+# Bajo gunicorn cada worker tiene su propia copia (son unos pocos MB), así que
+# tras actualizar el catálogo hay que llamar /catalog/refresh o reiniciar.
 # ---------------------------------------------------------------------------
-# PASADA 0 — Búsqueda directa por código en Supabase
-# ---------------------------------------------------------------------------
-def code_lookup(code, supabase, catalog_by_code=None):
+_CACHE = {
+    "catalog":   None,   # lista de entries (build_catalog_entry)
+    "by_code":   {},     # norm_code -> entry         (lookup O(1))
+    "by_norm":   {},     # norm_desc -> entry         (match exacto O(1))
+    "inverted":  {},     # keyword   -> set(índices)  (pre-filtro de candidatos)
+    "loaded_at": 0,
+}
+# TTL de la caché en segundos. Pon None para que NUNCA expire por tiempo
+# (se refresca solo a mano vía /catalog/refresh).
+_CACHE_TTL = 6 * 3600
+
+_supabase = None
+
+
+def _get_supabase():
+    """Crea el cliente de Supabase una sola vez y lo reutiliza."""
+    global _supabase
+    if _supabase is None:
+        _supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _supabase
+
+
+def _fetch_all_products():
     """
-    Busca un producto por su CodigoArt directamente.
-    1) Primero intenta en el catálogo en memoria (más rápido).
-    2) Si no encuentra, consulta Supabase con coincidencia exacta.
+    Trae TODO el catálogo paginando. IMPORTANTE: PostgREST (la capa que usa
+    Supabase por debajo) limita las respuestas a 1000 filas por defecto y
+    supabase-py no pagina automáticamente, así que lo hacemos con .range().
+    Solo pedimos las columnas que build_catalog_entry realmente usa.
+    """
+    PAGE_SIZE = 1000
+    rows = []
+    offset = 0
+    supabase = _get_supabase()
+    while True:
+        resp = supabase.table("products").select(
+            "CodigoArt, DescCortaArt, Precio"
+        ).range(offset, offset + PAGE_SIZE - 1).execute()
+
+        page = resp.data or []
+        if not page:
+            break
+
+        rows.extend(page)
+
+        # Si la página vino con menos de PAGE_SIZE filas, es la última.
+        if len(page) < PAGE_SIZE:
+            break
+
+        offset += PAGE_SIZE
+
+        # Salvaguarda contra bucles infinitos (catálogos enormes o bugs).
+        if offset > 100000:
+            break
+
+    return rows
+
+
+def _build_inverted(catalog):
+    """
+    Índice invertido: palabra clave -> conjunto de índices de productos que la
+    contienen como token. Solo tokens significativos (>=3 chars, no stopwords),
+    igual que extract_keywords. Permite pre-filtrar candidatos en O(keywords)
+    en vez de recorrer los 30k por línea.
+    """
+    inv = {}
+    for i, entry in enumerate(catalog):
+        for tok in entry['norm_set']:
+            if len(tok) >= 3 and tok not in STOPWORDS:
+                inv.setdefault(tok, set()).add(i)
+    return inv
+
+
+def load_catalog(force=False):
+    """Carga (o recarga) el catálogo en memoria y reconstruye los índices."""
+    fresh = _CACHE["catalog"] is not None and (
+        _CACHE_TTL is None or (time.time() - _CACHE["loaded_at"] < _CACHE_TTL)
+    )
+    if fresh and not force:
+        return
+
+    raw = _fetch_all_products()
+    catalog = [build_catalog_entry(row) for row in raw]
+
+    # Índice por código normalizado (lookup O(1)).
+    by_code = {e['norm_code']: e for e in catalog if e['norm_code']}
+
+    # Índice por descripción normalizada (match exacto O(1)). Si dos productos
+    # comparten la misma descripción normalizada, conservamos el primero.
+    by_norm = {}
+    for e in catalog:
+        if e['norm'] and e['norm'] not in by_norm:
+            by_norm[e['norm']] = e
+
+    _CACHE.update({
+        "catalog":   catalog,
+        "by_code":   by_code,
+        "by_norm":   by_norm,
+        "inverted":  _build_inverted(catalog),
+        "loaded_at": time.time(),
+    })
+
+
+def get_catalog():
+    """Devuelve la caché, cargándola de forma perezosa si aún no existe."""
+    if _CACHE["catalog"] is None or (
+        _CACHE_TTL is not None and time.time() - _CACHE["loaded_at"] >= _CACHE_TTL
+    ):
+        load_catalog()
+    return _CACHE
+
+
+def candidates(query, top_n=100):
+    """
+    Pre-filtro: devuelve hasta `top_n` productos del catálogo que comparten
+    palabras clave con la query, ordenados por número de coincidencias. El
+    fuzzy y el match por keywords corren SOLO sobre estos candidatos.
+    """
+    cache = get_catalog()
+    kws = extract_keywords(normalize(query))
+    if not kws:
+        return []
+
+    inv = cache["inverted"]
+    catalog = cache["catalog"]
+    cnt = Counter()
+    for kw in kws:
+        for idx in inv.get(kw, ()):
+            cnt[idx] += 1
+
+    if not cnt:
+        return []
+
+    return [catalog[i] for i, _ in cnt.most_common(top_n)]
+
+
+# ---------------------------------------------------------------------------
+# PASADA 0 — Búsqueda directa por código (en memoria)
+# ---------------------------------------------------------------------------
+def code_lookup(code, by_code):
+    """
+    Busca un producto por su CodigoArt en el catálogo en memoria (O(1)).
+    Como el catálogo completo está cacheado, ya no hace falta consultar
+    Supabase por línea: si el código no está aquí, no está en el catálogo.
     Retorna el entry del producto o None si no existe.
     """
     if not code:
         return None
-
     norm = normalize_code(code)
     if not norm:
         return None
-
-    # 1) Intentar en memoria primero
-    if catalog_by_code and norm in catalog_by_code:
-        return catalog_by_code[norm]
-
-    # 2) Consulta directa a Supabase (eq = igualdad exacta)
-    try:
-        resp = supabase.table("products").select(
-            "CodigoArt, DescCortaArt, Precio"
-        ).eq("CodigoArt", code).limit(1).execute()
-        rows = resp.data or []
-        if rows:
-            row = rows[0]
-            return {
-                'code':      row.get('CodigoArt', ''),
-                'norm_code': normalize_code(row.get('CodigoArt', '')),
-                'name':      row.get('DescCortaArt', ''),
-                'price':     str(row.get('Precio', '') or ''),
-                'norm':      normalize(row.get('DescCortaArt', '')),
-            }
-    except Exception:
-        pass
-
-    # 3) Último intento: si el código original tenía caracteres especiales,
-    #    probar con la versión normalizada (sin guiones/espacios)
-    if norm != str(code).strip().upper():
-        try:
-            resp = supabase.table("products").select(
-                "CodigoArt, DescCortaArt, Precio"
-            ).eq("CodigoArt", norm).limit(1).execute()
-            rows = resp.data or []
-            if rows:
-                row = rows[0]
-                return {
-                    'code':      row.get('CodigoArt', ''),
-                    'norm_code': normalize_code(row.get('CodigoArt', '')),
-                    'name':      row.get('DescCortaArt', ''),
-                    'price':     str(row.get('Precio', '') or ''),
-                    'norm':      normalize(row.get('DescCortaArt', '')),
-                }
-        except Exception:
-            pass
-
-    return None
+    return by_code.get(norm)
 
 
 # ---------------------------------------------------------------------------
-# PASADA 1 — Fuzzy Match en memoria (SequenceMatcher + Jaccard)
+# PASADA 2 — Fuzzy Match (SequenceMatcher + Jaccard) sobre candidatos
 # ---------------------------------------------------------------------------
-def fuzzy_match(query, catalog):
+def fuzzy_match(query, entries):
+    """Igual que antes, pero recibe el subconjunto de candidatos (~100) en
+    lugar de todo el catálogo."""
+    if not entries:
+        return None, 0.0
+
     norm_q  = normalize(query)
     q_words = set(norm_q.split())
 
     scored = []
-    for entry in catalog:
+    for entry in entries:
         norm_e  = entry['norm']
         e_words = entry['norm_set']
 
@@ -245,35 +364,26 @@ def fuzzy_match(query, catalog):
 
 
 # ---------------------------------------------------------------------------
-# PASADA 2 — Intersección de palabras clave en catálogo en memoria
+# PASADA 3 — Intersección de palabras clave sobre candidatos
 # ---------------------------------------------------------------------------
-def keyword_ilike_match(query, catalog, supabase=None):
+def keyword_ilike_match(query, entries):
     """
-    Intersección de palabras clave hecha en memoria sobre el catálogo ya
-    cargado y normalizado (sin acentos). Esto reemplaza la versión anterior
-    basada en ILIKE de Supabase, que NO era insensible a acentos cuando el
-    catálogo guardaba descripciones con tildes (p.ej. "Eléctrica").
+    Intersección de palabras clave hecha en memoria sobre los candidatos ya
+    pre-filtrados (sin acentos). Para cada palabra clave significativa marca
+    los productos cuyo nombre normalizado la contengan como substring, cuenta
+    coincidencias y elige al de mayor número (desempate por fuzzy score).
 
-    Para cada palabra clave significativa:
-      1. Recorre el catálogo y marca cada producto cuyo nombre normalizado
-         contenga la keyword como substring.
-      2. Cuenta en cuántas keywords aparece cada producto (intersección).
-      3. El ganador es el producto con mayor número de coincidencias.
-      4. En caso de empate, desempata con fuzzy score contra la query.
-
-    El parámetro `supabase` se mantiene por compatibilidad pero ya no se usa.
     Devuelve: (mejor_entry, keywords_coincidentes, total_keywords)
     """
     norm_q   = normalize(query)
     keywords = extract_keywords(norm_q)
 
-    if not keywords:
+    if not keywords or not entries:
         return None, 0, 0
 
     code_counter = Counter()
-
     for kw in keywords:
-        for entry in catalog:
+        for entry in entries:
             # 'norm' ya está sin acentos y en mayúsculas, así que el substring
             # match es totalmente insensible a acentos y a may/min.
             if kw in entry['norm']:
@@ -282,28 +392,27 @@ def keyword_ilike_match(query, catalog, supabase=None):
     if not code_counter:
         return None, 0, 0
 
-    # Indexar el catálogo por código una sola vez para resolver el ganador
-    catalog_by_code = {e['code']: e for e in catalog if e['code']}
+    # Indexar los candidatos por código para resolver el ganador
+    cand_by_code = {e['code']: e for e in entries if e['code']}
 
     total_keywords = len(keywords)
     max_count = code_counter.most_common(1)[0][1]
-    candidates = [c for c, count in code_counter.items() if count == max_count]
+    winners = [c for c, count in code_counter.items() if count == max_count]
 
-    if len(candidates) == 1:
-        best_code = candidates[0]
+    if len(winners) == 1:
+        best_code = winners[0]
     else:
         best_code = max(
-            candidates,
+            winners,
             key=lambda c: difflib.SequenceMatcher(
-                None, norm_q, catalog_by_code[c]['norm']
+                None, norm_q, cand_by_code[c]['norm']
             ).ratio()
         )
 
-    best_entry = catalog_by_code.get(best_code)
+    best_entry = cand_by_code.get(best_code)
     if best_entry is None:
         return None, 0, 0
 
-    # Devolvemos el entry con el formato esperado por match_product
     return {
         'code':  best_entry['code'],
         'name':  best_entry['name'],
@@ -315,18 +424,18 @@ def keyword_ilike_match(query, catalog, supabase=None):
 # ---------------------------------------------------------------------------
 # Lógica principal de matching (tres pasadas)
 # ---------------------------------------------------------------------------
-def match_product(query, code, catalog, catalog_by_code, catalog_by_norm, supabase):
+def match_product(query, code):
     """
-    Pasada 0: Búsqueda por código (si se proporcionó).
-      - Match exacto → confianza = 1.0, requiere_revision = False
-    Pasada 1: Match exacto por descripción normalizada (sin acentos, sin puntuación).
-      - Match exacto → confianza = 1.0, requiere_revision = False
-    Pasada 2: Fuzzy en memoria sobre la descripción.
-      - score >= 0.70 → resultado directo, requiere_revision = False
-    Pasada 3: Intersección de palabras clave en catálogo en memoria.
-      - Confianza proporcional escalada entre 0.40 y 0.69
-      - Si ninguna keyword encuentra nada → NO ENCONTRADO
+    Pasada 0: Búsqueda por código (si se proporcionó).  -> confianza 1.0
+    Pasada 1: Match exacto por descripción normalizada. -> confianza 1.0
+    Pasada 2: Fuzzy sobre candidatos. score >= 0.70     -> directo
+    Pasada 3: Intersección de keywords sobre candidatos -> 0.40-0.69
+    Si nada matchea -> NO ENCONTRADO.
     """
+    cache    = get_catalog()
+    by_code  = cache["by_code"]
+    by_norm  = cache["by_norm"]
+
     # --- Pasada 0: Código del producto ---
     code_to_try = code
     if not code_to_try and query:
@@ -334,7 +443,7 @@ def match_product(query, code, catalog, catalog_by_code, catalog_by_norm, supaba
         code_to_try = extract_code_from_text(query)
 
     if code_to_try:
-        match0 = code_lookup(code_to_try, supabase, catalog_by_code)
+        match0 = code_lookup(code_to_try, by_code)
         if match0:
             return {
                 "codigo":            match0['code'],
@@ -357,13 +466,9 @@ def match_product(query, code, catalog, catalog_by_code, catalog_by_norm, supaba
         }
 
     # --- Pasada 1: Match exacto por descripción normalizada ---
-    # Si la descripción del cliente, una vez normalizada (sin acentos, sin
-    # puntuación, sin espacios extra, mayúsculas, sinónimos de unidades
-    # aplicados), coincide letra por letra con la descripción normalizada de
-    # algún producto del catálogo, lo damos por bueno con confianza 1.0.
     norm_query = normalize(query)
-    if norm_query and norm_query in catalog_by_norm:
-        match_exact = catalog_by_norm[norm_query]
+    if norm_query and norm_query in by_norm:
+        match_exact = by_norm[norm_query]
         return {
             "codigo":            match_exact['code'],
             "nombre_catalogo":   match_exact['name'],
@@ -373,9 +478,26 @@ def match_product(query, code, catalog, catalog_by_code, catalog_by_norm, supaba
             "metodo":            "exacto",
         }
 
+    # --- Pre-filtro: candidatos del índice invertido (para Pasadas 2 y 3) ---
+    # NOTA: el fuzzy ya solo corre sobre estos candidatos. Si una descripción
+    # no comparte ninguna palabra clave con el catálogo, no habrá candidatos y
+    # se marca NO ENCONTRADO (antes el fuzzy barría los 30k; en la práctica
+    # esos matches puro-carácter eran raros y casi siempre espurios). Si hiciera
+    # falta, sube `top_n` en candidates().
+    cand = candidates(query)
+    if not cand:
+        return {
+            "codigo":            "NO ENCONTRADO",
+            "nombre_catalogo":   "NO ENCONTRADO",
+            "precio":            "",
+            "confianza":         0.0,
+            "requiere_revision": True,
+            "metodo":            "ninguno",
+        }
+
     # --- Pasada 2: Fuzzy ---
-    match1, score1 = fuzzy_match(query, catalog)
-    if score1 >= 0.70:
+    match1, score1 = fuzzy_match(query, cand)
+    if match1 and score1 >= 0.70:
         return {
             "codigo":            match1['code'],
             "nombre_catalogo":   match1['name'],
@@ -385,8 +507,8 @@ def match_product(query, code, catalog, catalog_by_code, catalog_by_norm, supaba
             "metodo":            "fuzzy",
         }
 
-    # --- Pasada 3: Intersección de keywords en catálogo en memoria ---
-    match2, matched_kw, total_kw = keyword_ilike_match(query, catalog, supabase)
+    # --- Pasada 3: Intersección de keywords sobre candidatos ---
+    match2, matched_kw, total_kw = keyword_ilike_match(query, cand)
 
     if match2 is None or matched_kw == 0:
         return {
@@ -490,65 +612,13 @@ def match_products():
                 status=400, mimetype='application/json'
             )
 
-        # Conexión a Supabase
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-        # Cargar catálogo completo — IMPORTANTE: PostgREST (la capa que usa
-        # Supabase por debajo) limita las respuestas a 1000 filas por defecto.
-        # supabase-py no pagina automáticamente, así que tenemos que hacerlo
-        # manualmente con .range(start, end). Si no, los productos cuyos id
-        # caen fuera de las primeras 1000 filas nunca se cargan al catálogo
-        # en memoria y por lo tanto nunca pueden matchear como exacto/fuzzy.
-        PAGE_SIZE = 1000
-        catalog_raw = []
-        offset = 0
-        while True:
-            resp = supabase.table("products").select(
-                "CodigoArt, DescCortaArt, Precio, "
-                "ATRIBUTO4, ValorAtrib4, ATRIBUTO5, ValorAtrib5, "
-                "ATRIBUTO6, ValorAtrib6, ATRIBUTO7, ValorAtrib7, "
-                "ATRIBUTO8, ValorAtrib8"
-            ).range(offset, offset + PAGE_SIZE - 1).execute()
-
-            page = resp.data or []
-            if not page:
-                break
-
-            catalog_raw.extend(page)
-
-            # Si la página vino con menos de PAGE_SIZE filas, es la última.
-            if len(page) < PAGE_SIZE:
-                break
-
-            offset += PAGE_SIZE
-
-            # Salvaguarda contra bucles infinitos (catálogos enormes o bugs).
-            if offset > 100000:
-                break
-
-        if not catalog_raw:
+        # Catálogo desde la caché en memoria (se carga una sola vez por proceso).
+        cache = get_catalog()
+        if not cache["catalog"]:
             return Response(
                 json.dumps({"error": "El catalogo esta vacio"}, ensure_ascii=False),
                 status=400, mimetype='application/json'
             )
-
-        catalog = [build_catalog_entry(row) for row in catalog_raw]
-
-        # Índice de catálogo por código normalizado (para lookup O(1))
-        catalog_by_code = {
-            entry['norm_code']: entry
-            for entry in catalog
-            if entry['norm_code']
-        }
-
-        # Índice de catálogo por descripción normalizada (para match exacto O(1)).
-        # Si dos productos del catálogo tienen exactamente la misma descripción
-        # normalizada, conservamos el primero (en la práctica son duplicados o
-        # variantes, y el match exacto no debería resolver ambigüedades).
-        catalog_by_norm = {}
-        for entry in catalog:
-            if entry['norm'] and entry['norm'] not in catalog_by_norm:
-                catalog_by_norm[entry['norm']] = entry
 
         # Procesar cada producto del cliente
         resultados = []
@@ -577,10 +647,7 @@ def match_products():
                 item.get('unit') or 'PZA'
             )
 
-            result = match_product(
-                descripcion, codigo_in,
-                catalog, catalog_by_code, catalog_by_norm, supabase
-            )
+            result = match_product(descripcion, codigo_in)
 
             resultados.append({
                 "original_text":        descripcion,
@@ -613,12 +680,43 @@ def match_products():
         )
 
 
+@app.route('/catalog/refresh', methods=['POST'])
+def catalog_refresh():
+    """Invalida y recarga la caché del catálogo. Llamar tras actualizar el
+    catálogo en Supabase (o reiniciar el servicio)."""
+    try:
+        load_catalog(force=True)
+        return Response(
+            json.dumps({"status": "ok", "productos": len(_CACHE["catalog"] or [])}),
+            status=200, mimetype='application/json'
+        )
+    except Exception as e:
+        return Response(
+            json.dumps({"error": str(e)}, ensure_ascii=False),
+            status=500, mimetype='application/json'
+        )
+
+
 @app.route('/health', methods=['GET'])
 def health():
-    return Response(json.dumps({"status": "ok"}), status=200, mimetype='application/json')
+    return Response(
+        json.dumps({
+            "status": "ok",
+            "catalogo_cargado": _CACHE["catalog"] is not None,
+            "productos": len(_CACHE["catalog"] or []),
+        }),
+        status=200, mimetype='application/json'
+    )
+
+
+# Precalentar la caché al arrancar. Bajo gunicorn esto corre una vez por worker
+# al importar el módulo; con `python app.py` corre antes de levantar el server.
+try:
+    load_catalog()
+except Exception as _e:
+    print(f"[startup] no se pudo precargar el catálogo: {_e}")
 
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
-
