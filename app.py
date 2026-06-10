@@ -5,6 +5,7 @@ import difflib
 import json
 import unicodedata
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, Response
 from supabase import create_client
 
@@ -577,6 +578,159 @@ def detect_description_column(rows):
     return best_col
 
 
+# ===========================================================================
+# FASE 2 — Validación semántica con LLM (deltas-only)
+# ---------------------------------------------------------------------------
+# En vez de pedirle al LLM que regenere TODO el JSON (lento, se trunca o se pasa
+# del timeout del webhook), aquí:
+#   - Solo se envían las líneas con match PROPUESTO a validar (metodo
+#     fuzzy/keyword). Las de codigo/exacto son certeras y NO se tocan; las de
+#     "ninguno" ya son NO ENCONTRADO.
+#   - El LLM devuelve SOLO los deltas (idx, confianza, requiere_revision, y
+#     opcionalmente NO ENCONTRADO). El merge se hace aquí, en memoria.
+#   - Las líneas ambiguas se procesan en lotes y en paralelo acotado.
+# Requiere la variable de entorno ANTHROPIC_API_KEY y el paquete `anthropic`.
+# Si no hay API key, la evaluación se omite (degrada a solo matching).
+# Esto REEMPLAZA al módulo de Anthropic que vivía en Make.
+# ===========================================================================
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+ANTHROPIC_MODEL   = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+LLM_BATCH_SIZE    = int(os.environ.get("LLM_BATCH_SIZE", "40"))
+LLM_MAX_WORKERS   = int(os.environ.get("LLM_MAX_WORKERS", "4"))
+
+_anthropic_client = None
+
+
+def _get_anthropic():
+    global _anthropic_client
+    if _anthropic_client is None:
+        import anthropic  # import perezoso: solo si se va a usar
+        _anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    return _anthropic_client
+
+
+EVALUATOR_SYSTEM = (
+    "Eres un evaluador semantico de productos industriales en Mexico. Recibiras "
+    "un arreglo JSON de lineas, cada una con: idx, descripcion_original, "
+    "nombre_catalogo y metodo. Valida si nombre_catalogo corresponde "
+    "semanticamente a descripcion_original y devuelve SOLO las correcciones.\n\n"
+    "CRITERIOS DE CONFIANZA:\n"
+    "- Mismo producto escrito distinto (espacios, mayusculas, orden) -> 1.0\n"
+    "- Mismo producto con abreviaturas conocidas o typos menores -> 0.90-0.99\n"
+    "- Probablemente el mismo pero con duda razonable -> 0.70-0.89\n"
+    "- Relacionado pero con diferencias importantes (modelo, capacidad, voltaje) -> 0.50-0.69\n"
+    "- No relacionados / completamente diferentes -> 0.0-0.49\n\n"
+    "ABREVIACIONES (no penalices por estas): P/=Para, C/=Con, S/=Sin, Jgo=Juego, "
+    "Mca=Marca, No.=Numero, Pza/Pz=Pieza, Term=Termomagnetico, Interr=Interruptor, "
+    "Volt/V=Voltaje, Amp/A=Amperes, Polos/P=Polos.\n\n"
+    "REGLA NO ENCONTRADO: si nombre_catalogo ya dice \"NO ENCONTRADO\", o si el "
+    "producto no tiene NINGUNA relacion con la descripcion, pon en esa linea "
+    "codigo=\"NO ENCONTRADO\", nombre_catalogo=\"NO ENCONTRADO\", confianza=0.0.\n\n"
+    "REGLA DE REVISION: requiere_revision = true si y solo si confianza < 0.90.\n\n"
+    "SALIDA (CRITICO): responde UNICAMENTE con un arreglo JSON valido, sin texto "
+    "ni markdown, empezando con '[' y terminando con ']'. Para cada linea de "
+    "entrada incluye exactamente: {\"idx\": <n>, \"confianza\": <0.0-1.0>, "
+    "\"requiere_revision\": <bool>}. Incluye ademas \"codigo\" y \"nombre_catalogo\" "
+    "SOLO si la cambias a \"NO ENCONTRADO\". No agregues otros campos ni lineas "
+    "que no esten en la entrada."
+)
+
+
+def _parse_deltas(text):
+    """Extrae el arreglo JSON de la respuesta del modelo de forma robusta."""
+    s = (text or "").strip()
+    a, b = s.find("["), s.rfind("]")
+    if a == -1 or b == -1 or b < a:
+        return []
+    try:
+        return json.loads(s[a:b + 1])
+    except Exception:
+        return []
+
+
+def _eval_batch(batch):
+    """Evalúa un lote de líneas ambiguas y devuelve la lista de deltas."""
+    payload = [
+        {
+            "idx":                  r["_idx"],
+            "descripcion_original": r["descripcion_original"],
+            "nombre_catalogo":      r["nombre_catalogo"],
+            "metodo":               r["metodo"],
+        }
+        for r in batch
+    ]
+    try:
+        client = _get_anthropic()
+        msg = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=4096,
+            system=EVALUATOR_SYSTEM,
+            messages=[{"role": "user",
+                       "content": json.dumps(payload, ensure_ascii=False)}],
+        )
+        text = "".join(
+            getattr(b, "text", "") for b in msg.content
+            if getattr(b, "type", "") == "text"
+        )
+        return _parse_deltas(text)
+    except Exception:
+        # Si un lote falla, no tumbamos el job: esas líneas quedan como vinieron.
+        return []
+
+
+def evaluate_with_llm(resultados):
+    """Aplica la validación semántica del LLM SOLO a las líneas fuzzy/keyword.
+    Devuelve la misma lista con confianza/requiere_revision corregidos (y, en su
+    caso, marcados como NO ENCONTRADO). El formato de salida no cambia."""
+    if not ANTHROPIC_API_KEY:
+        return resultados
+
+    ambiguous = []
+    for i, r in enumerate(resultados):
+        if r.get("metodo") in ("fuzzy", "keyword"):
+            r["_idx"] = i
+            ambiguous.append(r)
+
+    if not ambiguous:
+        return resultados
+
+    batches = [ambiguous[k:k + LLM_BATCH_SIZE]
+               for k in range(0, len(ambiguous), LLM_BATCH_SIZE)]
+
+    deltas = []
+    workers = max(1, min(LLM_MAX_WORKERS, len(batches)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for res in ex.map(_eval_batch, batches):
+            deltas.extend(res or [])
+
+    for d in deltas:
+        if not isinstance(d, dict):
+            continue
+        i = d.get("idx")
+        if not isinstance(i, int) or not (0 <= i < len(resultados)):
+            continue
+        r = resultados[i]
+        if d.get("codigo") == "NO ENCONTRADO" or d.get("nombre_catalogo") == "NO ENCONTRADO":
+            r["codigo"]            = "NO ENCONTRADO"
+            r["nombre_catalogo"]   = "NO ENCONTRADO"
+            r["precio"]            = ""
+            r["confianza"]         = 0.0
+            r["requiere_revision"] = True
+            continue
+        if "confianza" in d:
+            try:
+                conf = round(float(d["confianza"]), 3)
+            except (TypeError, ValueError):
+                continue
+            r["confianza"]         = conf
+            r["requiere_revision"] = bool(conf < 0.90)
+
+    for r in resultados:
+        r.pop("_idx", None)
+
+    return resultados
+
+
 # ---------------------------------------------------------------------------
 # Rutas Flask
 # ---------------------------------------------------------------------------
@@ -662,6 +816,11 @@ def match_products():
                 "cant":                 cant,
                 "unid":                 unid,
             })
+
+        # FASE 2 — Validación semántica con LLM (solo líneas fuzzy/keyword,
+        # salida deltas-only, merge en memoria). Sustituye al módulo de Anthropic
+        # que vivía en Make.
+        resultados = evaluate_with_llm(resultados)
 
         response_data = {
             "lines":              resultados,
