@@ -1,5 +1,12 @@
 flask
+flask-cors
 gunicorn
 httpx
 supabase
 anthropic
+requests
+pandas
+openpyxl
+xlrd
+pdfplumber
+python-docx
