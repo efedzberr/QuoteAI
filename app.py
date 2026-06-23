@@ -1592,16 +1592,21 @@ def match_start():
 
         sb = _new_supabase(service=True)
 
-        if referencia:
-            existing = sb.table('jobs').select('id').eq(
-                'referencia', referencia).limit(1).execute()
-            if not existing.data:
-                sb.table('jobs').insert({
-                    'referencia': referencia, 'cliente': customer,
-                    'status': 'matching', 'total_lineas': len(rows), 'progreso': 0,
-                }).execute()
-        else:
+        if not referencia:
             referencia = f"QAI-{int(time.time() * 1000)}"
+
+        # Asegura que el job EXISTA antes de arrancar el worker. Si Bolt ya lo
+        # creo, lo actualiza; si no (o si hubo cualquier desajuste de referencia),
+        # lo crea aqui mismo. Asi el procesamiento SIEMPRE arranca.
+        existing = sb.table('jobs').select('id').eq(
+            'referencia', referencia).limit(1).execute()
+        if existing.data:
+            sb.table('jobs').update({
+                'cliente': customer or None, 'status': 'matching',
+                'total_lineas': len(rows), 'progreso': 0, 'error': None,
+                'updated_at': _now_iso(),
+            }).eq('referencia', referencia).execute()
+        else:
             sb.table('jobs').insert({
                 'referencia': referencia, 'cliente': customer,
                 'status': 'matching', 'total_lineas': len(rows), 'progreso': 0,
@@ -1653,6 +1658,17 @@ def catalog_refresh():
 
 @app.route('/health', methods=['GET'])
 def health():
+    # Autodiagnóstico: ¿el cliente service_role puede VER la tabla jobs?
+    # Si esto falla o regresa null, la llave SUPABASE_SERVICE_KEY está mal
+    # (es de otro proyecto, o es la anon), y por eso no avanza nada.
+    svc = {"service_key_set": bool(SUPABASE_SERVICE_KEY)}
+    try:
+        r = _new_supabase(service=True).table('jobs').select(
+            'id', count='exact').limit(1).execute()
+        svc["jobs_visibles"] = getattr(r, 'count', None)
+    except Exception as e:
+        svc["jobs_error"] = str(e)[:300]
+
     return _json({
         "status": "ok",
         "catalogo_cargado": _CACHE["catalog"] is not None,
@@ -1660,6 +1676,7 @@ def health():
         "extractor": "on",
         "docling_url": DOCLING_OCR_URL,
         "llm": bool(ANTHROPIC_API_KEY),
+        "supabase_service": svc,
     }, 200)
 
 
