@@ -1670,6 +1670,24 @@ SF_ACCOUNT_SEARCH_URL = os.environ.get(
 SF_SEARCH_TIMEOUT = int(os.environ.get("SF_SEARCH_TIMEOUT", "30"))
 
 
+def _log_event(evento, user_email=None, request_data=None,
+               response_data=None, status=None, ok=None):
+    """Guarda un registro en app_logs. Nunca debe tumbar la petición principal:
+    si el log falla, solo lo imprime y sigue."""
+    try:
+        sb = _new_supabase(service=True)
+        sb.table('app_logs').insert({
+            'evento':     evento,
+            'user_email': user_email,
+            'request':    request_data,
+            'response':   response_data,
+            'status':     status,
+            'ok':         ok,
+        }).execute()
+    except Exception as e:
+        print(f"[app_logs] no se pudo guardar el log: {e}")
+
+
 @app.route('/accounts/search', methods=['POST'])
 def accounts_search():
     """Recibe { userEmail, query } y consulta el servicio de cuentas de Salesforce.
@@ -1687,24 +1705,35 @@ def accounts_search():
         # Si Bolt ya mandó comodines, los respetamos; si no, envolvemos en %...%
         search_query = raw_query if '%' in raw_query else f"%{raw_query}%"
 
+        # Esto es EXACTAMENTE lo que Railway le manda a Salesforce.
+        sf_request = {"userEmail": user_email, "searchQuery": search_query}
+
         import requests
         try:
             resp = requests.post(
                 SF_ACCOUNT_SEARCH_URL,
-                json={"userEmail": user_email, "searchQuery": search_query},
+                json=sf_request,
                 headers={"Content-Type": "application/json"},
                 timeout=SF_SEARCH_TIMEOUT,
             )
         except Exception as e:
+            _log_event('account_search', user_email, sf_request,
+                       {"error": str(e)}, None, False)
             return _json({"error": "No se pudo conectar a Salesforce",
                           "message": str(e)}, 502)
 
         try:
             payload = resp.json()
         except Exception:
+            _log_event('account_search', user_email, sf_request,
+                       {"raw": resp.text[:1000]}, resp.status_code, False)
             return _json({"error": "Respuesta de Salesforce no es JSON",
                           "status": resp.status_code,
                           "raw": resp.text[:300]}, 502)
+
+        # Guarda el log: lo que se envió y lo que Salesforce respondió.
+        _log_event('account_search', user_email, sf_request, payload,
+                   resp.status_code, bool(payload.get('success', resp.ok)))
 
         # Reenviamos tal cual lo que Salesforce devolvió (records, totalSize, etc.)
         return _json(payload, resp.status_code if resp.status_code in (200, 400) else 200)
