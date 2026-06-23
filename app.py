@@ -1662,10 +1662,22 @@ def health():
     # Si esto falla o regresa null, la llave SUPABASE_SERVICE_KEY está mal
     # (es de otro proyecto, o es la anon), y por eso no avanza nada.
     svc = {"service_key_set": bool(SUPABASE_SERVICE_KEY)}
+
+    # ¿A qué proyecto de Supabase está conectado Railway? (el host NO es secreto)
     try:
-        r = _new_supabase(service=True).table('jobs').select(
-            'id', count='exact').limit(1).execute()
-        svc["jobs_visibles"] = getattr(r, 'count', None)
+        host = (SUPABASE_URL or "").split("//")[-1].split(".")[0]
+        svc["proyecto"] = host
+    except Exception:
+        svc["proyecto"] = None
+
+    try:
+        sb = _new_supabase(service=True)
+        rj = sb.table('jobs').select('id', count='exact').limit(1).execute()
+        svc["jobs_visibles"] = getattr(rj, 'count', None)
+        # Cuenta products con LA MISMA llave service, para confirmar que esta
+        # conexión ve el mismo proyecto donde está tu catálogo.
+        rp = sb.table('products').select('CodigoArt', count='exact').limit(1).execute()
+        svc["products_visibles"] = getattr(rp, 'count', None)
     except Exception as e:
         svc["jobs_error"] = str(e)[:300]
 
