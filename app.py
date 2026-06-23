@@ -7,6 +7,8 @@ import unicodedata
 import math
 import io
 import base64
+import threading
+from datetime import datetime, timezone
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, Response
@@ -50,6 +52,11 @@ CORS(app, resources={r"/*": {"origins": _cors_origins}})
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+# Para ESCRIBIR avance y job_items en segundo plano, Railway necesita la
+# service_role key (omite RLS). Si no se define, cae a SUPABASE_KEY.
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or SUPABASE_KEY
+# Tamaño de lote del trabajo asíncrono de matching (cada lote = un avance).
+JOB_CHUNK = int(os.environ.get("JOB_CHUNK", "30"))
 
 # ---------------------------------------------------------------------------
 # Sinónimos de unidades técnicas
@@ -236,6 +243,18 @@ def _get_supabase():
         from supabase import create_client  # import perezoso
         _supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     return _supabase
+
+
+def _new_supabase(service=False):
+    """Crea un cliente nuevo de Supabase (para hilos en segundo plano).
+    Con service=True usa la service_role key para poder ESCRIBIR jobs/job_items."""
+    from supabase import create_client
+    key = SUPABASE_SERVICE_KEY if service else SUPABASE_KEY
+    return create_client(SUPABASE_URL, key)
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _fetch_all_products():
@@ -1313,6 +1332,146 @@ def extract_file(content, filename):
     raise ValueError(f"Tipo de archivo no soportado: .{ext}")
 
 
+# ===========================================================================
+# FASE 3 (NUEVA) — MATCHING ASÍNCRONO POR LOTES (jobs + job_items)
+# ---------------------------------------------------------------------------
+# Bolt manda TODAS las filas a /match/start. Railway crea/actualiza el job,
+# contesta de inmediato y procesa en segundo plano: por cada lote hace matching
+# + validación LLM, inserta los renglones en job_items y actualiza jobs.progreso.
+# Bolt queda libre; el usuario puede salir y volver a ver el avance leyendo
+# las tablas jobs/job_items desde Supabase (que ya hace su frontend).
+# ===========================================================================
+def _line_from_item(item, desc_column, code_column):
+    """Construye el renglón de resultado de UNA fila (matching, sin LLM)."""
+    descripcion = (str(item.get(desc_column, '') or '').strip()
+                   if desc_column else '')
+    codigo_in = (str(item.get(code_column, '') or '').strip()
+                 if code_column else '')
+    if not descripcion and not codigo_in:
+        return None
+
+    cant = (item.get('Cant') or item.get('cant') or item.get('cantidad')
+            or item.get('qty') or item.get('quantity') or '1')
+    unid = (item.get('Unid') or item.get('unid') or item.get('unidad')
+            or item.get('uom') or item.get('unit') or 'PZA')
+
+    result = match_product(descripcion, codigo_in)
+    return {
+        "original_text":        descripcion,
+        "descripcion_original": descripcion,
+        "codigo_original":      codigo_in,
+        "codigo":               result["codigo"],
+        "nombre_catalogo":      result["nombre_catalogo"],
+        "precio":               result["precio"],
+        "confianza":            result["confianza"],
+        "requiere_revision":    result["requiere_revision"],
+        "metodo":               result["metodo"],
+        "cant":                 cant,
+        "unid":                 unid,
+    }
+
+
+def _num(x):
+    """Convierte a número; devuelve None si no se puede."""
+    if x is None:
+        return None
+    try:
+        v = float(str(x).replace(',', '.'))
+        return v if math.isfinite(v) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _job_line_row(job_id, r):
+    """Mapea un resultado de matching a una fila de la tabla job_lines."""
+    no_match = (r.get('metodo') == 'ninguno'
+                or str(r.get('codigo')) == 'NO ENCONTRADO')
+    precio = None if no_match else _num(r.get('precio'))
+    cantidad = _num(r.get('cant'))
+    if cantidad is None or cantidad <= 0:
+        cantidad = 1
+    total = round(cantidad * precio, 2) if precio is not None else None
+    unidad = str(r.get('unid') or '') or None
+    return {
+        'job_id':               job_id,
+        'line_index':           r.get('_li', 0),
+        'codigo_original':      (r.get('codigo_original') or None),
+        'descripcion_original': (r.get('descripcion_original') or None),
+        'unidad_original':      unidad,
+        'cantidad':             cantidad,
+        'producto_codigo':      None if no_match else (r.get('codigo') or None),
+        'producto_descripcion': None if no_match else (r.get('nombre_catalogo') or None),
+        'unidad_medida':        unidad,
+        'precio_unitario':      precio,
+        'confianza':            _num(r.get('confianza')),
+        'requiere_revision':    bool(r.get('requiere_revision')),
+        'total_linea':          total,
+        'origen':               'sin_match' if no_match else 'auto',
+        # 'estado' se queda con su default ('pendiente')
+    }
+
+
+def _run_match_job(referencia, rows):
+    """Worker en segundo plano: procesa todas las filas por lotes, escribiendo
+    el avance y los job_items en Supabase. Se ejecuta en un hilo daemon."""
+    sb = _new_supabase(service=True)
+    try:
+        jr = sb.table('jobs').select('id').eq('referencia', referencia).limit(1).execute()
+        if not jr.data:
+            return
+        job_id = jr.data[0]['id']
+
+        get_catalog()  # asegurar catálogo en memoria
+        desc_column = detect_description_column(rows)
+        code_column = detect_code_column(rows)
+        total = len(rows)
+
+        sb.table('jobs').update({
+            'status': 'matching', 'total_lineas': total,
+            'progreso': 0, 'error': None, 'updated_at': _now_iso(),
+        }).eq('id', job_id).execute()
+
+        line_index = 0
+        for start in range(0, total, JOB_CHUNK):
+            chunk = rows[start:start + JOB_CHUNK]
+            results = []
+            for item in chunk:
+                line = _line_from_item(item, desc_column, code_column)
+                if line is not None:
+                    line['_li'] = line_index
+                    results.append(line)
+                line_index += 1
+
+            # Validación semántica LLM SOLO de las líneas fuzzy/keyword del lote.
+            results = evaluate_with_llm(results)
+
+            if results:
+                payload = [_job_line_row(job_id, r) for r in results]
+                try:
+                    sb.table('job_lines').upsert(
+                        payload, on_conflict='job_id,line_index'
+                    ).execute()
+                except Exception as e:
+                    print(f"[job {referencia}] error guardando job_lines: {e}")
+
+            processed = min(total, start + len(chunk))
+            sb.table('jobs').update({
+                'progreso': processed, 'updated_at': _now_iso(),
+            }).eq('id', job_id).execute()
+
+        sb.table('jobs').update({
+            'status': 'completado', 'progreso': total, 'updated_at': _now_iso(),
+        }).eq('id', job_id).execute()
+
+    except Exception as e:
+        try:
+            sb.table('jobs').update({
+                'status': 'error', 'error': str(e), 'updated_at': _now_iso(),
+            }).eq('referencia', referencia).execute()
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Helper de respuesta JSON
 # ---------------------------------------------------------------------------
@@ -1393,44 +1552,9 @@ def match_products():
 
         resultados = []
         for item in client_products:
-            descripcion = (
-                str(item.get(desc_column, '') or '').strip()
-                if desc_column else ''
-            )
-            codigo_in = (
-                str(item.get(code_column, '') or '').strip()
-                if code_column else ''
-            )
-
-            if not descripcion and not codigo_in:
-                continue
-
-            cant = (
-                item.get('Cant') or item.get('cant') or
-                item.get('cantidad') or item.get('qty') or
-                item.get('quantity') or '1'
-            )
-            unid = (
-                item.get('Unid') or item.get('unid') or
-                item.get('unidad') or item.get('uom') or
-                item.get('unit') or 'PZA'
-            )
-
-            result = match_product(descripcion, codigo_in)
-
-            resultados.append({
-                "original_text":        descripcion,
-                "descripcion_original": descripcion,
-                "codigo_original":      codigo_in,
-                "codigo":               result["codigo"],
-                "nombre_catalogo":      result["nombre_catalogo"],
-                "precio":               result["precio"],
-                "confianza":            result["confianza"],
-                "requiere_revision":    result["requiere_revision"],
-                "metodo":               result["metodo"],
-                "cant":                 cant,
-                "unid":                 unid,
-            })
+            line = _line_from_item(item, desc_column, code_column)
+            if line is not None:
+                resultados.append(line)
 
         resultados = evaluate_with_llm(resultados)
 
@@ -1443,6 +1567,76 @@ def match_products():
         }
         return _json(response_data, 200)
 
+    except Exception as e:
+        return _json({"error": str(e)}, 500)
+
+
+@app.route('/match/start', methods=['POST'])
+def match_start():
+    """Arranca el matching ASÍNCRONO. Crea/actualiza el job, lanza el worker en
+    segundo plano y contesta de inmediato (202) con la referencia. Body:
+    { referencia?, customerName?, rows: [...] }."""
+    try:
+        data = request.get_json()
+        if not data:
+            return _json({"error": "No se recibieron datos"}, 400)
+
+        rows = (data.get('rows') or data.get('productos') or
+                data.get('items') or data.get('articulos') or
+                data.get('products') or [])
+        if not rows:
+            return _json({"error": "No se encontraron productos"}, 400)
+
+        referencia = data.get('referencia') or data.get('reference')
+        customer = data.get('customerName') or data.get('cliente') or ''
+
+        sb = _new_supabase(service=True)
+
+        if referencia:
+            existing = sb.table('jobs').select('id').eq(
+                'referencia', referencia).limit(1).execute()
+            if not existing.data:
+                sb.table('jobs').insert({
+                    'referencia': referencia, 'cliente': customer,
+                    'status': 'matching', 'total_lineas': len(rows), 'progreso': 0,
+                }).execute()
+        else:
+            referencia = f"QAI-{int(time.time() * 1000)}"
+            sb.table('jobs').insert({
+                'referencia': referencia, 'cliente': customer,
+                'status': 'matching', 'total_lineas': len(rows), 'progreso': 0,
+            }).execute()
+
+        threading.Thread(
+            target=_run_match_job, args=(referencia, rows), daemon=True
+        ).start()
+
+        return _json({
+            "referencia": referencia, "status": "matching", "total": len(rows),
+        }, 202)
+
+    except Exception as e:
+        return _json({"error": str(e)}, 500)
+
+
+@app.route('/jobs/<referencia>', methods=['GET'])
+def job_status(referencia):
+    """Estado de un job por referencia (avance, total, status, error).
+    Bolt también puede leer esto directo de Supabase; este endpoint es opcional."""
+    try:
+        sb = _new_supabase(service=True)
+        jr = sb.table('jobs').select('*').eq(
+            'referencia', referencia).limit(1).execute()
+        if not jr.data:
+            return _json({"error": "job no encontrado"}, 404)
+        job = jr.data[0]
+        try:
+            ci = sb.table('job_lines').select(
+                'id', count='exact').eq('job_id', job['id']).execute()
+            job['items_count'] = getattr(ci, 'count', None)
+        except Exception:
+            job['items_count'] = None
+        return _json(job)
     except Exception as e:
         return _json({"error": str(e)}, 500)
 
