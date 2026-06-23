@@ -1731,14 +1731,38 @@ def accounts_search():
                           "status": resp.status_code,
                           "raw": resp.text[:300]}, 502)
 
-        # Guarda el log: lo que se envió y lo que Salesforce respondió.
-        _log_event('account_search', user_email, sf_request, payload,
-                   resp.status_code, bool(payload.get('success', resp.ok)))
+        # Salesforce podría contestar como objeto {success, records, ...} O como
+        # una lista de cuentas directa. Normalizamos ambos casos sin tronar.
+        if isinstance(payload, dict):
+            records = payload.get('records')
+            records = records if isinstance(records, list) else []
+            success = payload.get('success')
+            success = resp.ok if success is None else success
+            total = payload.get('totalSize')
+            total = total if isinstance(total, int) else len(records)
+            message = payload.get('message')
+        elif isinstance(payload, list):
+            records = payload
+            success = resp.ok
+            total = len(records)
+            message = None
+        else:
+            records, success, total, message = [], resp.ok, 0, None
 
-        # Reenviamos tal cual lo que Salesforce devolvió (records, totalSize, etc.)
-        return _json(payload, resp.status_code if resp.status_code in (200, 400) else 200)
+        result = {"success": bool(success), "totalSize": total,
+                  "records": records, "message": message}
+
+        # Guarda SIEMPRE el log con lo que se envió y lo que Salesforce devolvió
+        # (payload crudo), para poder depurar cualquier forma de respuesta.
+        _log_event('account_search', user_email, sf_request, payload,
+                   resp.status_code, bool(success))
+
+        return _json(result, 200)
 
     except Exception as e:
+        # Aun ante un error inesperado, dejamos rastro para depurar.
+        _log_event('account_search', locals().get('user_email'),
+                   locals().get('sf_request'), {"error": str(e)}, None, False)
         return _json({"error": "Error interno", "message": str(e)}, 500)
 
 
