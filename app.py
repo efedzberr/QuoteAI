@@ -1656,6 +1656,63 @@ def catalog_refresh():
         return _json({"error": str(e)}, 500)
 
 
+# ===========================================================================
+# Búsqueda de cuentas en Salesforce (proxy)
+# ---------------------------------------------------------------------------
+# Bolt no debe llamar a Salesforce directamente (CORS + para poder guardar el
+# id/noCliente después). Railway recibe { userEmail, query } y reenvía a la URL
+# del servicio Apex de Salesforce, agregando los comodines % alrededor del texto.
+# ===========================================================================
+SF_ACCOUNT_SEARCH_URL = os.environ.get(
+    "SF_ACCOUNT_SEARCH_URL",
+    "https://impulsoramonterrey--af2.sandbox.my.salesforce.com/services/apexrest/account-searchtipo",
+)
+SF_SEARCH_TIMEOUT = int(os.environ.get("SF_SEARCH_TIMEOUT", "30"))
+
+
+@app.route('/accounts/search', methods=['POST'])
+def accounts_search():
+    """Recibe { userEmail, query } y consulta el servicio de cuentas de Salesforce.
+    Devuelve la lista de cuentas tal cual la entrega Salesforce."""
+    try:
+        data = request.get_json(silent=True) or {}
+        user_email = (data.get('userEmail') or data.get('email') or '').strip()
+        raw_query = (data.get('query') or data.get('searchQuery') or '').strip()
+
+        if not user_email:
+            return _json({"error": "Falta userEmail"}, 400)
+        if not raw_query:
+            return _json({"success": True, "totalSize": 0, "records": []})
+
+        # Si Bolt ya mandó comodines, los respetamos; si no, envolvemos en %...%
+        search_query = raw_query if '%' in raw_query else f"%{raw_query}%"
+
+        import requests
+        try:
+            resp = requests.post(
+                SF_ACCOUNT_SEARCH_URL,
+                json={"userEmail": user_email, "searchQuery": search_query},
+                headers={"Content-Type": "application/json"},
+                timeout=SF_SEARCH_TIMEOUT,
+            )
+        except Exception as e:
+            return _json({"error": "No se pudo conectar a Salesforce",
+                          "message": str(e)}, 502)
+
+        try:
+            payload = resp.json()
+        except Exception:
+            return _json({"error": "Respuesta de Salesforce no es JSON",
+                          "status": resp.status_code,
+                          "raw": resp.text[:300]}, 502)
+
+        # Reenviamos tal cual lo que Salesforce devolvió (records, totalSize, etc.)
+        return _json(payload, resp.status_code if resp.status_code in (200, 400) else 200)
+
+    except Exception as e:
+        return _json({"error": "Error interno", "message": str(e)}, 500)
+
+
 @app.route('/health', methods=['GET'])
 def health():
     # Autodiagnóstico: ¿el cliente service_role puede VER la tabla jobs?
