@@ -1669,6 +1669,107 @@ SF_ACCOUNT_SEARCH_URL = os.environ.get(
 )
 SF_SEARCH_TIMEOUT = int(os.environ.get("SF_SEARCH_TIMEOUT", "30"))
 
+# --- Login a Salesforce (OAuth 2.0 Username-Password) ----------------------
+# Todas estas credenciales se leen de variables de ambiente en Railway; NUNCA
+# van en el código. El password debe incluir el security token pegado al final
+# si el usuario lo requiere (Salesforce: password + security_token).
+SF_TOKEN_URL      = os.environ.get("SF_TOKEN_URL", "https://test.salesforce.com/services/oauth2/token")
+SF_CLIENT_ID      = os.environ.get("SF_CLIENT_ID")
+SF_CLIENT_SECRET  = os.environ.get("SF_CLIENT_SECRET")
+SF_USERNAME       = os.environ.get("SF_USERNAME")
+SF_PASSWORD       = os.environ.get("SF_PASSWORD")
+SF_SECURITY_TOKEN = os.environ.get("SF_SECURITY_TOKEN", "")
+SF_LOGIN_TIMEOUT  = int(os.environ.get("SF_LOGIN_TIMEOUT", "30"))
+
+# Token en caché (en memoria del proceso). Se reusa entre búsquedas.
+_SF_TOKEN = {"access_token": None, "instance_url": None}
+
+
+def _sf_login():
+    """Hace login en Salesforce y guarda el access_token en caché.
+    Devuelve (token, instance_url) o lanza excepción con el detalle."""
+    if not (SF_CLIENT_ID and SF_CLIENT_SECRET and SF_USERNAME and SF_PASSWORD):
+        raise RuntimeError(
+            "Faltan credenciales de Salesforce en Railway "
+            "(SF_CLIENT_ID, SF_CLIENT_SECRET, SF_USERNAME, SF_PASSWORD).")
+
+    import requests
+    # Salesforce espera el password con el security token pegado al final.
+    password = SF_PASSWORD + (SF_SECURITY_TOKEN or "")
+    resp = requests.post(
+        SF_TOKEN_URL,
+        data={
+            "grant_type":    "password",
+            "client_id":     SF_CLIENT_ID,
+            "client_secret": SF_CLIENT_SECRET,
+            "username":      SF_USERNAME,
+            "password":      password,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=SF_LOGIN_TIMEOUT,
+    )
+    try:
+        body = resp.json()
+    except Exception:
+        raise RuntimeError(f"Login Salesforce no devolvió JSON ({resp.status_code}): {resp.text[:200]}")
+
+    token = body.get("access_token") if isinstance(body, dict) else None
+    if not token:
+        # Deja rastro del error de login (sin exponer credenciales).
+        _log_event('sf_login', SF_USERNAME, {"token_url": SF_TOKEN_URL},
+                   body, resp.status_code, False)
+        raise RuntimeError(f"Login Salesforce falló: {body}")
+
+    _SF_TOKEN["access_token"] = token
+    _SF_TOKEN["instance_url"] = body.get("instance_url")
+    _log_event('sf_login', SF_USERNAME, {"token_url": SF_TOKEN_URL},
+               {"ok": True, "instance_url": body.get("instance_url")},
+               resp.status_code, True)
+    return token, _SF_TOKEN["instance_url"]
+
+
+def _sf_get_token(force=False):
+    """Devuelve un token válido; hace login si no hay o si se pide forzar."""
+    if force or not _SF_TOKEN["access_token"]:
+        return _sf_login()
+    return _SF_TOKEN["access_token"], _SF_TOKEN["instance_url"]
+
+
+def _sf_account_search(sf_request, _retried=False):
+    """Llama al servicio Apex con el token en el header. Si la sesión expiró,
+    se vuelve a loguear UNA vez y reintenta."""
+    import requests
+    token, _ = _sf_get_token()
+    resp = requests.post(
+        SF_ACCOUNT_SEARCH_URL,
+        json=sf_request,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {token}"},
+        timeout=SF_SEARCH_TIMEOUT,
+    )
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = {"raw": resp.text[:1000]}
+
+    # ¿Sesión expirada/ inválida? -> re-login y un solo reintento.
+    if not _retried and _is_invalid_session(payload, resp.status_code):
+        _sf_get_token(force=True)
+        return _sf_account_search(sf_request, _retried=True)
+
+    return resp, payload
+
+
+def _is_invalid_session(payload, status):
+    """Detecta el error INVALID_SESSION_ID venga como objeto o como lista."""
+    if status in (401, 403):
+        return True
+    items = payload if isinstance(payload, list) else [payload]
+    for it in items:
+        if isinstance(it, dict) and it.get("errorCode") == "INVALID_SESSION_ID":
+            return True
+    return False
+
 
 def _log_event(evento, user_email=None, request_data=None,
                response_data=None, status=None, ok=None):
@@ -1691,7 +1792,7 @@ def _log_event(evento, user_email=None, request_data=None,
 @app.route('/accounts/search', methods=['POST'])
 def accounts_search():
     """Recibe { userEmail, query } y consulta el servicio de cuentas de Salesforce.
-    Devuelve la lista de cuentas tal cual la entrega Salesforce."""
+    Railway se autentica solo (login + token en caché + reintento si expira)."""
     try:
         data = request.get_json(silent=True) or {}
         user_email = (data.get('userEmail') or data.get('email') or '').strip()
@@ -1708,28 +1809,13 @@ def accounts_search():
         # Esto es EXACTAMENTE lo que Railway le manda a Salesforce.
         sf_request = {"userEmail": user_email, "searchQuery": search_query}
 
-        import requests
         try:
-            resp = requests.post(
-                SF_ACCOUNT_SEARCH_URL,
-                json=sf_request,
-                headers={"Content-Type": "application/json"},
-                timeout=SF_SEARCH_TIMEOUT,
-            )
+            resp, payload = _sf_account_search(sf_request)
         except Exception as e:
             _log_event('account_search', user_email, sf_request,
                        {"error": str(e)}, None, False)
-            return _json({"error": "No se pudo conectar a Salesforce",
+            return _json({"error": "No se pudo consultar Salesforce",
                           "message": str(e)}, 502)
-
-        try:
-            payload = resp.json()
-        except Exception:
-            _log_event('account_search', user_email, sf_request,
-                       {"raw": resp.text[:1000]}, resp.status_code, False)
-            return _json({"error": "Respuesta de Salesforce no es JSON",
-                          "status": resp.status_code,
-                          "raw": resp.text[:300]}, 502)
 
         # Salesforce podría contestar como objeto {success, records, ...} O como
         # una lista de cuentas directa. Normalizamos ambos casos sin tronar.
@@ -1752,15 +1838,13 @@ def accounts_search():
         result = {"success": bool(success), "totalSize": total,
                   "records": records, "message": message}
 
-        # Guarda SIEMPRE el log con lo que se envió y lo que Salesforce devolvió
-        # (payload crudo), para poder depurar cualquier forma de respuesta.
+        # Guarda SIEMPRE el log con lo que se envió y lo que Salesforce devolvió.
         _log_event('account_search', user_email, sf_request, payload,
                    resp.status_code, bool(success))
 
         return _json(result, 200)
 
     except Exception as e:
-        # Aun ante un error inesperado, dejamos rastro para depurar.
         _log_event('account_search', locals().get('user_email'),
                    locals().get('sf_request'), {"error": str(e)}, None, False)
         return _json({"error": "Error interno", "message": str(e)}, 500)
