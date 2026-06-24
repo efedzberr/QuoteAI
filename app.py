@@ -1883,6 +1883,12 @@ def health():
         "docling_url": DOCLING_OCR_URL,
         "llm": bool(ANTHROPIC_API_KEY),
         "supabase_service": svc,
+        "salesforce": {
+            "token_url":        SF_TOKEN_URL,
+            "account_search_url": SF_ACCOUNT_SEARCH_URL,
+            "credenciales_set": bool(SF_CLIENT_ID and SF_CLIENT_SECRET
+                                     and SF_USERNAME and SF_PASSWORD),
+        },
     }, 200)
 
 
