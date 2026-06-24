@@ -1862,7 +1862,10 @@ def accounts_search():
 # (para poder copiarlo y compartirlo con el consultor), e intenta enviarlo al
 # endpoint de Salesforce (que por ahora puede no existir -> error esperado).
 # ===========================================================================
-SF_QUOTE_CREATE_URL = os.environ.get("SF_QUOTE_CREATE_URL", "")  # se define cuando exista
+SF_QUOTE_CREATE_URL = os.environ.get(
+    "SF_QUOTE_CREATE_URL",
+    "https://impulsoramonterrey--af2.sandbox.my.salesforce.com/services/apexrest/oppquote",
+)
 
 
 def _sf_send_quote(payload, _retried=False):
@@ -1946,7 +1949,8 @@ def quote_to_salesforce():
 
         oportunidad = {
             "accountName":        account_name,
-            "opportunityName":    f"QUOTEAI-{account_name} {num_productos}",
+            # Nota: Salesforce arma el nombre de la oportunidad como
+            # "QuoteAI-YYYY-MM-DD"; por eso ya NO mandamos opportunityName.
             "projectType":        "QuoteAI",
             "forecastCategory":   "Pipeline",
             "stage":              "En Seguimiento",
