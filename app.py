@@ -1960,7 +1960,7 @@ def quote_to_salesforce():
             fecha_nombre = f"{mx_now.day:02d}{_meses[mx_now.month - 1]}{mx_now.year % 100:02d}"
         except Exception:
             fecha_nombre = ''
-        cliente_50 = (account_name or '')[:50].strip()
+        cliente_50 = re.sub(r'\s+', ' ', (account_name or '')).strip()[:40].strip()
         opportunity_name = f"{referencia} - {cliente_50} - {fecha_nombre}"
 
         oportunidad = {
