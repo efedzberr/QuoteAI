@@ -1459,8 +1459,12 @@ def _run_match_job(referencia, rows):
                 'progreso': processed, 'updated_at': _now_iso(),
             }).eq('id', job_id).execute()
 
+        # Al terminar el match el trabajo queda EN ESPERA DE VALIDACIÓN del
+        # usuario (human-in-the-loop). NO lo marcamos como completado: eso solo
+        # ocurre cuando el usuario valida en la pantalla "Validar productos".
         sb.table('jobs').update({
-            'status': 'completado', 'progreso': total, 'updated_at': _now_iso(),
+            'status': 'matching_completado', 'progreso': total,
+            'updated_at': _now_iso(),
         }).eq('id', job_id).execute()
 
     except Exception as e:
