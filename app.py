@@ -1854,6 +1854,134 @@ def accounts_search():
         return _json({"error": "Error interno", "message": str(e)}, 500)
 
 
+# ===========================================================================
+# Enviar cotización validada a Salesforce
+# ---------------------------------------------------------------------------
+# Bolt envía: datos de la cuenta, la referencia, las líneas YA validadas, y el
+# PDF en base64 (si existe). Railway arma el JSON final, lo GUARDA en app_logs
+# (para poder copiarlo y compartirlo con el consultor), e intenta enviarlo al
+# endpoint de Salesforce (que por ahora puede no existir -> error esperado).
+# ===========================================================================
+SF_QUOTE_CREATE_URL = os.environ.get("SF_QUOTE_CREATE_URL", "")  # se define cuando exista
+
+
+def _sf_send_quote(payload, _retried=False):
+    """Envía el JSON de la cotización al endpoint de creación en Salesforce.
+    Si la sesión expiró, re-login y un reintento. Devuelve (resp, body)."""
+    import requests
+    token, _ = _sf_get_token()
+    resp = requests.post(
+        SF_QUOTE_CREATE_URL,
+        json=payload,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {token}"},
+        timeout=SF_SEARCH_TIMEOUT,
+    )
+    try:
+        body = resp.json()
+    except Exception:
+        body = {"raw": resp.text[:1000]}
+    if not _retried and _is_invalid_session(body, resp.status_code):
+        _sf_get_token(force=True)
+        return _sf_send_quote(payload, _retried=True)
+    return resp, body
+
+
+@app.route('/quotes/send-to-salesforce', methods=['POST'])
+def quote_to_salesforce():
+    """Recibe la cotización validada de Bolt, arma el JSON final, lo registra en
+    app_logs, e intenta enviarlo a Salesforce."""
+    try:
+        data = request.get_json(silent=True) or {}
+
+        user_email = (data.get('userEmail') or '').strip()
+        referencia = (data.get('referencia') or '').strip()
+
+        # Cuenta de Salesforce (lo que guardó Bolt al elegir la cuenta).
+        cuenta = {
+            "salesforceAccountId": data.get('salesforceAccountId'),
+            "noCliente":           data.get('noCliente'),
+            "ownerId":             data.get('ownerId'),
+            "accountName":         data.get('accountName') or data.get('cliente'),
+        }
+
+        # Solo líneas VALIDADAS que traigan producto (las ignoradas/sin match no
+        # se envían). Bolt manda 'lineas'; normalizamos los campos requeridos.
+        lineas_in = data.get('lineas') or data.get('lines') or []
+        lineas = []
+        for l in lineas_in:
+            if not isinstance(l, dict):
+                continue
+            codigo = l.get('producto_codigo') or l.get('codigo')
+            if not codigo:   # sin producto válido -> no se envía
+                continue
+            cantidad = _num(l.get('cantidad') if l.get('cantidad') is not None
+                            else l.get('cant'))
+            precio = _num(l.get('precio_unitario') if l.get('precio_unitario') is not None
+                          else l.get('precio'))
+            total = _num(l.get('total_linea'))
+            if total is None and cantidad is not None and precio is not None:
+                total = round(cantidad * precio, 2)
+            lineas.append({
+                "codigo":          codigo,
+                "nombre":          l.get('producto_descripcion') or l.get('nombre'),
+                "unidad_medida":   l.get('unidad_medida') or l.get('unid'),
+                "cantidad":        cantidad,
+                "precio_unitario": precio,
+                "total_linea":     total,
+            })
+
+        pdf_base64 = data.get('pdfBase64') or data.get('pdf_base64')
+
+        # JSON FINAL que recibiría Salesforce (este es el ejemplo para el consultor).
+        quote_payload = {
+            "referencia":     referencia,
+            "userEmail":      user_email,
+            "cuenta":         cuenta,
+            "lineas":         lineas,
+            "total_lineas":   len(lineas),
+            "pdf_generado":   bool(pdf_base64),
+            "pdf_base64":     pdf_base64,
+        }
+
+        # Para el LOG no guardamos el PDF completo (puede ser enorme): dejamos una
+        # marca de su tamaño. El JSON que se ENVÍA sí lleva el PDF.
+        quote_for_log = dict(quote_payload)
+        quote_for_log['pdf_base64'] = (
+            f"<base64 de {len(pdf_base64)} chars>" if pdf_base64 else None)
+
+        # Si todavía NO hay endpoint configurado, solo registramos el JSON y
+        # avisamos. Así el consultor puede usar el log como ejemplo.
+        if not SF_QUOTE_CREATE_URL:
+            _log_event('quote_to_salesforce', user_email, quote_for_log,
+                       {"status": "pendiente",
+                        "message": "SF_QUOTE_CREATE_URL no configurada todavía"},
+                       None, False)
+            return _json({
+                "success": False,
+                "pending": True,
+                "message": "El endpoint de Salesforce aún no está configurado. "
+                           "El JSON quedó guardado en app_logs (quote_to_salesforce).",
+                "preview": quote_for_log,
+            }, 200)
+
+        # Si ya hay endpoint, intentamos enviar de verdad.
+        try:
+            resp, body = _sf_send_quote(quote_payload)
+            _log_event('quote_to_salesforce', user_email, quote_for_log,
+                       body, resp.status_code, resp.ok)
+            return _json({"success": resp.ok, "salesforce": body}, 200)
+        except Exception as e:
+            _log_event('quote_to_salesforce', user_email, quote_for_log,
+                       {"error": str(e)}, None, False)
+            return _json({"success": False,
+                          "message": f"No se pudo enviar a Salesforce: {e}",
+                          "preview": quote_for_log}, 502)
+
+    except Exception as e:
+        return _json({"error": "Error interno", "message": str(e)}, 500)
+
+
 @app.route('/health', methods=['GET'])
 def health():
     # Autodiagnóstico: ¿el cliente service_role puede VER la tabla jobs?
