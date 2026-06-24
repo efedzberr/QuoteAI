@@ -1997,7 +1997,26 @@ def quote_to_salesforce():
             resp, body = _sf_send_quote(quote_payload)
             _log_event('quote_to_salesforce', user_email, quote_for_log,
                        body, resp.status_code, resp.ok)
-            return _json({"success": resp.ok, "salesforce": body}, 200)
+
+            # Si Salesforce creó la oportunidad, guardamos sus IDs en el job para
+            # poder referenciarla/actualizarla después (y evitar reenvíos).
+            ok = bool(isinstance(body, dict) and body.get('success')) or resp.ok
+            if ok and referencia:
+                try:
+                    sb = _new_supabase(service=True)
+                    sb.table('jobs').update({
+                        'sf_opportunity_id': (body.get('opportunityId')
+                                              if isinstance(body, dict) else None),
+                        'sf_quote_id':       (body.get('quoteId')
+                                              if isinstance(body, dict) else None),
+                        'sf_sent_at':        _now_iso(),
+                        'sf_response':       body,
+                        'updated_at':        _now_iso(),
+                    }).eq('referencia', referencia).execute()
+                except Exception as e:
+                    print(f"[quote_to_salesforce] no se pudo guardar IDs SF: {e}")
+
+            return _json({"success": ok, "salesforce": body}, 200)
         except Exception as e:
             _log_event('quote_to_salesforce', user_email, quote_for_log,
                        {"error": str(e)}, None, False)
