@@ -1933,11 +1933,34 @@ def quote_to_salesforce():
 
         pdf_base64 = data.get('pdfBase64') or data.get('pdf_base64')
 
+        # --- Bloque OPORTUNIDAD (se genera automático con las reglas dadas) ----
+        account_name = cuenta.get('accountName') or ''
+        num_productos = len(lineas)
+        amount_total = round(
+            sum((l.get('total_linea') or 0) for l in lineas), 2)
+        try:
+            from datetime import datetime, timedelta, timezone
+            close_date = (datetime.now(timezone.utc) + timedelta(days=1)).strftime('%Y-%m-%d')
+        except Exception:
+            close_date = None
+
+        oportunidad = {
+            "accountName":        account_name,
+            "opportunityName":    f"QUOTEAI-{account_name} {num_productos}",
+            "projectType":        "QuoteAI",
+            "forecastCategory":   "Pipeline",
+            "stage":              "En Seguimiento",
+            "closeDate":          close_date,        # hoy + 1
+            "probability":        30,                # %
+            "amount":             amount_total,      # total de la cotización
+        }
+
         # JSON FINAL que recibiría Salesforce (este es el ejemplo para el consultor).
         quote_payload = {
             "referencia":     referencia,
             "userEmail":      user_email,
             "cuenta":         cuenta,
+            "oportunidad":    oportunidad,
             "lineas":         lineas,
             "total_lineas":   len(lineas),
             "pdf_generado":   bool(pdf_base64),
