@@ -1941,31 +1941,16 @@ def quote_to_salesforce():
         num_productos = len(lineas)
         amount_total = round(
             sum((l.get('total_linea') or 0) for l in lineas), 2)
-
-        from datetime import datetime, timedelta, timezone
-        # closeDate = hoy + 1, formato YYYY-MM-DD
         try:
+            from datetime import datetime, timedelta, timezone
             close_date = (datetime.now(timezone.utc) + timedelta(days=1)).strftime('%Y-%m-%d')
         except Exception:
             close_date = None
 
-        # Nombre de la oportunidad:
-        #   "<referencia> - <50 chars del cliente> - <DDMESYY>"
-        #   ej. "QAI-1782341425583 - CONSTRUCCION DE HOGARES JAVER SA DE CV - 26JUN26"
-        # La fecha es HOY en horario de México; mes en 3 letras (español) en mayúsculas.
-        try:
-            mx_now = datetime.now(timezone(timedelta(hours=-6)))  # CDMX (UTC-6)
-            _meses = ['ENE', 'FEB', 'MAR', 'ABR', 'MAY', 'JUN',
-                      'JUL', 'AGO', 'SEP', 'OCT', 'NOV', 'DIC']
-            fecha_nombre = f"{mx_now.day:02d}{_meses[mx_now.month - 1]}{mx_now.year % 100:02d}"
-        except Exception:
-            fecha_nombre = ''
-        cliente_50 = re.sub(r'\s+', ' ', (account_name or '')).strip()[:40].strip()
-        opportunity_name = f"{referencia} - {cliente_50} - {fecha_nombre}"
-
         oportunidad = {
             "accountName":        account_name,
-            "opportunityName":    opportunity_name,
+            # Nota: Salesforce arma el nombre de la oportunidad como
+            # "QuoteAI-YYYY-MM-DD"; por eso ya NO mandamos opportunityName.
             "projectType":        "QuoteAI",
             "forecastCategory":   "Pipeline",
             "stage":              "En Seguimiento",
@@ -2012,32 +1997,130 @@ def quote_to_salesforce():
             resp, body = _sf_send_quote(quote_payload)
             _log_event('quote_to_salesforce', user_email, quote_for_log,
                        body, resp.status_code, resp.ok)
-
-            # Si Salesforce creó la oportunidad, guardamos sus IDs en el job para
-            # poder referenciarla/actualizarla después (y evitar reenvíos).
-            ok = bool(isinstance(body, dict) and body.get('success')) or resp.ok
-            if ok and referencia:
-                try:
-                    sb = _new_supabase(service=True)
-                    sb.table('jobs').update({
-                        'sf_opportunity_id': (body.get('opportunityId')
-                                              if isinstance(body, dict) else None),
-                        'sf_quote_id':       (body.get('quoteId')
-                                              if isinstance(body, dict) else None),
-                        'sf_sent_at':        _now_iso(),
-                        'sf_response':       body,
-                        'updated_at':        _now_iso(),
-                    }).eq('referencia', referencia).execute()
-                except Exception as e:
-                    print(f"[quote_to_salesforce] no se pudo guardar IDs SF: {e}")
-
-            return _json({"success": ok, "salesforce": body}, 200)
+            return _json({"success": resp.ok, "salesforce": body}, 200)
         except Exception as e:
             _log_event('quote_to_salesforce', user_email, quote_for_log,
                        {"error": str(e)}, None, False)
             return _json({"success": False,
                           "message": f"No se pudo enviar a Salesforce: {e}",
                           "preview": quote_for_log}, 502)
+
+    except Exception as e:
+        return _json({"error": "Error interno", "message": str(e)}, 500)
+
+
+# ===========================================================================
+# Subir el PDF de la cotización a Salesforce (endpoint dedicado)
+# ---------------------------------------------------------------------------
+# Segunda llamada del flujo: una vez creada la oportunidad/quote y con el
+# quoteId ya existente, Bolt manda { quoteId, pdfBase64 } a Railway y Railway
+# lo reenvia al Apex REST quotePdfUpload. Reusa el login/token/reintento que ya
+# existe (_sf_get_token / _is_invalid_session), igual que _sf_send_quote.
+# ===========================================================================
+SF_PDF_UPLOAD_URL = os.environ.get(
+    "SF_PDF_UPLOAD_URL",
+    "https://impulsoramonterrey--af2.sandbox.my.salesforce.com/services/apexrest/quotePdfUpload",
+)
+
+# Tope del PDF REAL (no del base64). 4 MiB reales -> ~5.3 MB en base64, debajo
+# del heap sincrono de Apex (~6 MB). Ajustable por variable de ambiente.
+MAX_PDF_BYTES = int(os.environ.get("MAX_PDF_BYTES", str(4 * 1024 * 1024)))
+
+
+def _strip_b64_prefix(b64):
+    """Quita el prefijo 'data:application/pdf;base64,' si Bolt lo antepuso.
+    Apex (EncodingUtil.base64Decode) truena si llega con el prefijo."""
+    if not b64:
+        return b64
+    head = b64[:64]
+    if "base64," in head:
+        return b64.split("base64,", 1)[1]
+    return b64
+
+
+def _b64_real_bytes(b64):
+    """Tamano real del archivo (en bytes) calculado desde el base64 SIN
+    decodificarlo: len(base64) * 3/4 menos el padding. Evita cargar el PDF
+    entero en memoria solo para medirlo."""
+    s = "".join(b64.split())  # quita saltos de linea y espacios
+    n = len(s)
+    if n == 0:
+        return 0
+    pad = 2 if s.endswith("==") else (1 if s.endswith("=") else 0)
+    return (n // 4) * 3 - pad
+
+
+def _sf_upload_pdf(quote_id, pdf_b64, _retried=False):
+    """Manda el PDF al endpoint quotePdfUpload con el token en el header.
+    Si la sesion expiro, re-login y un solo reintento. Devuelve (resp, body)."""
+    import requests
+    token, _ = _sf_get_token()
+    resp = requests.post(
+        SF_PDF_UPLOAD_URL,
+        # OJO: Salesforce espera 'quoteId' y 'pdfbase64' (minuscula la b),
+        # exactamente como en el contrato del Apex REST.
+        json={"quoteId": quote_id, "pdfbase64": pdf_b64},
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {token}"},
+        timeout=SF_SEARCH_TIMEOUT,
+    )
+    try:
+        body = resp.json()
+    except Exception:
+        body = {"raw": resp.text[:1000]}
+    if not _retried and _is_invalid_session(body, resp.status_code):
+        _sf_get_token(force=True)
+        return _sf_upload_pdf(quote_id, pdf_b64, _retried=True)
+    return resp, body
+
+
+@app.route('/quotes/upload-pdf', methods=['POST'])
+def quote_upload_pdf():
+    """Recibe { quoteId, pdfBase64, userEmail? } de Bolt, valida el tamano,
+    y reenvia el PDF al endpoint quotePdfUpload de Salesforce."""
+    try:
+        data = request.get_json(silent=True) or {}
+
+        quote_id = (data.get('quoteId') or data.get('quote_id') or '').strip()
+        user_email = (data.get('userEmail') or '').strip()
+        pdf_b64 = data.get('pdfBase64') or data.get('pdf_base64') or ''
+
+        if not quote_id:
+            return _json({"success": False, "error": "Falta quoteId"}, 400)
+        if not pdf_b64:
+            return _json({"success": False, "error": "Falta pdfBase64"}, 400)
+
+        # Limpia el prefijo si vino, y mide el tamano real ANTES de mandar.
+        pdf_b64 = _strip_b64_prefix(pdf_b64)
+        real_bytes = _b64_real_bytes(pdf_b64)
+
+        if real_bytes > MAX_PDF_BYTES:
+            mb = round(real_bytes / (1024 * 1024), 2)
+            limite_mb = round(MAX_PDF_BYTES / (1024 * 1024), 2)
+            msg = (f"El PDF pesa {mb} MB y el limite por ahora es {limite_mb} MB. "
+                   f"No se puede enviar de momento.")
+            _log_event('quote_upload_pdf', user_email,
+                       {"quoteId": quote_id, "pdf_bytes": real_bytes},
+                       {"rechazado": "tamano", "limite": MAX_PDF_BYTES},
+                       413, False)
+            return _json({"success": False, "tooLarge": True,
+                          "pdfBytes": real_bytes, "limitBytes": MAX_PDF_BYTES,
+                          "message": msg}, 413)
+
+        # Para el log NO guardamos el base64 (puede ser enorme): solo el tamano.
+        req_for_log = {"quoteId": quote_id, "pdf_bytes": real_bytes}
+
+        try:
+            resp, body = _sf_upload_pdf(quote_id, pdf_b64)
+            _log_event('quote_upload_pdf', user_email, req_for_log,
+                       body, resp.status_code, resp.ok)
+            return _json({"success": resp.ok, "quoteId": quote_id,
+                          "salesforce": body}, 200 if resp.ok else 502)
+        except Exception as e:
+            _log_event('quote_upload_pdf', user_email, req_for_log,
+                       {"error": str(e)}, None, False)
+            return _json({"success": False,
+                          "message": f"No se pudo subir el PDF: {e}"}, 502)
 
     except Exception as e:
         return _json({"error": "Error interno", "message": str(e)}, 500)
