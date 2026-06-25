@@ -1941,16 +1941,31 @@ def quote_to_salesforce():
         num_productos = len(lineas)
         amount_total = round(
             sum((l.get('total_linea') or 0) for l in lineas), 2)
+
+        from datetime import datetime, timedelta, timezone
+        # closeDate = hoy + 1, formato YYYY-MM-DD
         try:
-            from datetime import datetime, timedelta, timezone
             close_date = (datetime.now(timezone.utc) + timedelta(days=1)).strftime('%Y-%m-%d')
         except Exception:
             close_date = None
 
+        # Nombre de la oportunidad:
+        #   "<referencia> - <50 chars del cliente> - <DDMESYY>"
+        #   ej. "QAI-1782341425583 - CONSTRUCCION DE HOGARES JAVER SA DE CV - 26JUN26"
+        # La fecha es HOY en horario de México; mes en 3 letras (español) en mayúsculas.
+        try:
+            mx_now = datetime.now(timezone(timedelta(hours=-6)))  # CDMX (UTC-6)
+            _meses = ['ENE', 'FEB', 'MAR', 'ABR', 'MAY', 'JUN',
+                      'JUL', 'AGO', 'SEP', 'OCT', 'NOV', 'DIC']
+            fecha_nombre = f"{mx_now.day:02d}{_meses[mx_now.month - 1]}{mx_now.year % 100:02d}"
+        except Exception:
+            fecha_nombre = ''
+        cliente_50 = re.sub(r'\s+', ' ', (account_name or '')).strip()[:40].strip()
+        opportunity_name = f"{referencia} - {cliente_50} - {fecha_nombre}"
+
         oportunidad = {
             "accountName":        account_name,
-            # Nota: Salesforce arma el nombre de la oportunidad como
-            # "QuoteAI-YYYY-MM-DD"; por eso ya NO mandamos opportunityName.
+            "opportunityName":    opportunity_name,
             "projectType":        "QuoteAI",
             "forecastCategory":   "Pipeline",
             "stage":              "En Seguimiento",
@@ -1997,7 +2012,26 @@ def quote_to_salesforce():
             resp, body = _sf_send_quote(quote_payload)
             _log_event('quote_to_salesforce', user_email, quote_for_log,
                        body, resp.status_code, resp.ok)
-            return _json({"success": resp.ok, "salesforce": body}, 200)
+
+            # Si Salesforce creó la oportunidad, guardamos sus IDs en el job para
+            # poder referenciarla/actualizarla después (y evitar reenvíos).
+            ok = bool(isinstance(body, dict) and body.get('success')) or resp.ok
+            if ok and referencia:
+                try:
+                    sb = _new_supabase(service=True)
+                    sb.table('jobs').update({
+                        'sf_opportunity_id': (body.get('opportunityId')
+                                              if isinstance(body, dict) else None),
+                        'sf_quote_id':       (body.get('quoteId')
+                                              if isinstance(body, dict) else None),
+                        'sf_sent_at':        _now_iso(),
+                        'sf_response':       body,
+                        'updated_at':        _now_iso(),
+                    }).eq('referencia', referencia).execute()
+                except Exception as e:
+                    print(f"[quote_to_salesforce] no se pudo guardar IDs SF: {e}")
+
+            return _json({"success": ok, "salesforce": body}, 200)
         except Exception as e:
             _log_event('quote_to_salesforce', user_email, quote_for_log,
                        {"error": str(e)}, None, False)
