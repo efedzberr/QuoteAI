@@ -2228,7 +2228,9 @@ def _sf_create_products(productos_sf, _retried=False):
     import requests
     token, _ = _sf_get_token()
     payload = {"NoProductos": len(productos_sf), "Productos": productos_sf}
-    resp = requests.post(
+    # OJO: el Apex de 'productos' esta implementado con @HttpPut, no @HttpPost.
+    # Salesforce responde METHOD_NOT_ALLOWED si se manda POST. Por eso va PUT.
+    resp = requests.put(
         SF_PRODUCTS_CREATE_URL,
         json=payload,
         headers={"Content-Type": "application/json",
