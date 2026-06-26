@@ -2160,6 +2160,140 @@ def quote_upload_pdf():
         return _json({"error": "Error interno", "message": str(e)}, 500)
 
 
+# ===========================================================================
+# Crear productos nuevos en Salesforce (endpoint dedicado)
+# ---------------------------------------------------------------------------
+# Primer paso del envio: los productos creados manualmente en la validacion
+# (tabla productos_nuevos) deben existir en Salesforce ANTES de crear la
+# oportunidad. Bolt manda los productos nuevos de la cotizacion que aun no se
+# han sincronizado; Railway los mapea al contrato del Apex 'productos' y los
+# reenvia. Mismo patron proxy que _sf_send_quote / _sf_upload_pdf.
+# Mapeo acordado (solo Name es obligatorio; lo que no haya, no se manda):
+#   Name                -> descripcion_corta
+#   ProductCode         -> codigo (si existe)
+#   Description         -> descripcion_corta
+#   Descripcion2        -> "" (en blanco)
+#   Codigofamilia       -> marca
+#   Nombrefamilia       -> marca
+#   Nombrelineaproducto -> categoria
+#   UnidadMedida        -> unidad_medida
+#   PrecioLista         -> precio_unitario
+#   (Nombrecodestadistico, Codigocategoria, SRP*, Inner_Value, Master: no se mandan)
+# ===========================================================================
+SF_PRODUCTS_CREATE_URL = os.environ.get(
+    "SF_PRODUCTS_CREATE_URL",
+    "https://impulsoramonterrey--af2.sandbox.my.salesforce.com/services/apexrest/productos",
+)
+
+
+def _map_producto_nuevo_to_sf(p):
+    """Mapea una fila de productos_nuevos al contrato del endpoint 'productos'.
+    Solo 'Name' es obligatorio; los campos sin valor simplemente no se mandan."""
+    name = (p.get("descripcion_corta") or "").strip()
+    sf = {"Name": name}
+
+    codigo = (p.get("codigo") or "").strip()
+    if codigo:
+        sf["ProductCode"] = codigo
+
+    if name:
+        sf["Description"] = name
+
+    # Descripcion2 se manda en blanco de forma explicita (acordado).
+    sf["Descripcion2"] = ""
+
+    marca = (p.get("marca") or "").strip()
+    if marca:
+        sf["Codigofamilia"] = marca
+        sf["Nombrefamilia"] = marca
+
+    categoria = (p.get("categoria") or "").strip()
+    if categoria:
+        sf["Nombrelineaproducto"] = categoria
+
+    um = (p.get("unidad_medida") or "").strip()
+    if um:
+        sf["UnidadMedida"] = um
+
+    precio = p.get("precio_unitario")
+    if precio is not None:
+        sf["PrecioLista"] = precio
+
+    return sf
+
+
+def _sf_create_products(productos_sf, _retried=False):
+    """Manda los productos mapeados al endpoint 'productos' con el token en el
+    header. Reintento unico si la sesion expiro. Devuelve (resp, body)."""
+    import requests
+    token, _ = _sf_get_token()
+    payload = {"NoProductos": len(productos_sf), "Productos": productos_sf}
+    resp = requests.post(
+        SF_PRODUCTS_CREATE_URL,
+        json=payload,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {token}"},
+        timeout=SF_SEARCH_TIMEOUT,
+    )
+    try:
+        body = resp.json()
+    except Exception:
+        body = {"raw": resp.text[:1000]}
+    if not _retried and _is_invalid_session(body, resp.status_code):
+        _sf_get_token(force=True)
+        return _sf_create_products(productos_sf, _retried=True)
+    return resp, body
+
+
+@app.route('/products/create-in-salesforce', methods=['POST'])
+def products_create_in_salesforce():
+    """Recibe { productos: [...filas de productos_nuevos...], userEmail? } y los
+    crea en Salesforce. Solo Name (descripcion_corta) es obligatorio.
+    Devuelve idsEnviados para que Bolt marque esos productos como sincronizados."""
+    try:
+        data = request.get_json(silent=True) or {}
+        user_email = (data.get('userEmail') or '').strip()
+        productos = data.get('productos') or []
+
+        if not isinstance(productos, list):
+            return _json({"success": False, "error": "productos debe ser una lista"}, 400)
+
+        # Nada que crear: exito inmediato para que la cadena siga a la oportunidad.
+        if len(productos) == 0:
+            return _json({"success": True, "creados": 0, "idsEnviados": [],
+                          "message": "Sin productos nuevos por crear"}, 200)
+
+        mapeados = []
+        ids_enviados = []
+        for p in productos:
+            sf = _map_producto_nuevo_to_sf(p)
+            if not sf.get("Name"):
+                return _json({"success": False,
+                              "error": "Un producto nuevo no tiene descripcion corta (Name)",
+                              "productoId": p.get("id")}, 400)
+            mapeados.append(sf)
+            if p.get("id"):
+                ids_enviados.append(p.get("id"))
+
+        req_for_log = {"NoProductos": len(mapeados), "ids": ids_enviados}
+
+        try:
+            resp, body = _sf_create_products(mapeados)
+            _log_event('products_create_sf', user_email, req_for_log,
+                       body, resp.status_code, resp.ok)
+            return _json({"success": resp.ok, "creados": len(mapeados),
+                          "idsEnviados": ids_enviados, "salesforce": body},
+                         200 if resp.ok else 502)
+        except Exception as e:
+            _log_event('products_create_sf', user_email, req_for_log,
+                       {"error": str(e)}, None, False)
+            return _json({"success": False,
+                          "message": f"No se pudieron crear los productos: {e}"}, 502)
+
+    except Exception as e:
+        return _json({"error": "Error interno", "message": str(e)}, 500)
+
+
 @app.route('/health', methods=['GET'])
 def health():
     # Autodiagnóstico: ¿el cliente service_role puede VER la tabla jobs?
