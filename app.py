@@ -2189,15 +2189,24 @@ SF_PRODUCTS_CREATE_URL = os.environ.get(
 def _map_producto_nuevo_to_sf(p):
     """Mapea una fila de productos_nuevos al contrato del endpoint 'productos'.
     Solo 'Name' es obligatorio; los campos sin valor simplemente no se mandan."""
-    name = (p.get("descripcion_corta") or "").strip()
+    codigo = (p.get("codigo") or "").strip()
+    desc_corta = (p.get("descripcion_corta") or "").strip()
+
+    # Impulsora identifica los productos en Salesforce por Name. El oppquote
+    # busca por codigo, asi que Name y ProductCode llevan AMBOS el codigo del
+    # producto para que la oportunidad los encuentre.
+    # (Fallback defensivo: si por alguna razon no hubiera codigo, usamos la
+    #  descripcion corta para no mandar un Name vacio, que es el unico campo
+    #  obligatorio. Con el codigo obligatorio en Bolt esto no deberia ocurrir.)
+    name = codigo or desc_corta
     sf = {"Name": name}
 
-    codigo = (p.get("codigo") or "").strip()
     if codigo:
         sf["ProductCode"] = codigo
 
-    if name:
-        sf["Description"] = name
+    # Description conserva la descripcion legible del producto (no el codigo).
+    if desc_corta:
+        sf["Description"] = desc_corta
 
     # Descripcion2 se manda en blanco de forma explicita (acordado).
     sf["Descripcion2"] = ""
